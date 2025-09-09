@@ -1,0 +1,38 @@
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function POST(request: NextRequest) {
+  try {
+    // Parse the JSON request body
+    const requestBody = await request.json();
+    
+    // Log the incoming JSON request
+    console.log('Received JSON request:', JSON.stringify(requestBody, null, 2));
+    
+    // Prepare the response
+    const response = {
+      "commands": [
+        {
+          "type": "com.okta.telephony.action"
+        },
+        {
+          "value": {
+            "status": "SUCCESS",
+            "provider": "VONAGE",
+            "transactionId": "SM49a8ece2822d44e4adaccd7ed268f954",
+            "transactionMetadata": "Duration=300ms"
+          }
+        }
+      ]
+    };
+    
+    // Return the JSON response
+    return NextResponse.json(response, { status: 200 });
+    
+  } catch (error) {
+    console.error('Error processing request:', error);
+    return NextResponse.json(
+      { error: 'Invalid JSON request' },
+      { status: 400 }
+    );
+  }
+}
