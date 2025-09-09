@@ -18,6 +18,10 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
+  if (request.nextUrl.pathname.startsWith("/api/inlinehook")) {
+    return NextResponse.next();
+  }
+
   const { origin } = new URL(request.url);
   const session = await auth0.getSession(request);
 
