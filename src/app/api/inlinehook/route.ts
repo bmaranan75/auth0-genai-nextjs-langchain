@@ -59,11 +59,11 @@ export async function POST(request: NextRequest) {
        "error":[
           {
              "errorSummary":"Failed to deliver SMS OTP to test.user@okta.com",
-             "errorCauses":{
+             "errorCauses":[{
                 "errorSummary":"Provider could not deliver OTP",
                 "reason":"The content of the message is not supported",
                 "location":"South Africa"
-             }
+             }]
           }
        ]
     };
