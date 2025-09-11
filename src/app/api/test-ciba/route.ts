@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getUser } from '@/lib/auth0';
-import { shopOnlineToolLangChain } from '@/lib/tools/shop-online-langchain';
+import { shopOnlineToolLangChain } from '@/lib/tools/checkout-langchain';
 
 export async function POST(req: NextRequest) {
   try {

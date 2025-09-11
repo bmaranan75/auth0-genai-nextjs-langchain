@@ -18,6 +18,22 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
+  if (request.nextUrl.pathname.startsWith("/api/add-to-cart")) {
+    return NextResponse.next();
+  }
+
+  if (request.nextUrl.pathname.startsWith("/api/delete-cart")) {
+    return NextResponse.next();
+  }
+
+  if (request.nextUrl.pathname.startsWith("/api/catalog")) {
+    return NextResponse.next();
+  }
+
+  if (request.nextUrl.pathname.startsWith("/api/get-cart")) {
+    return NextResponse.next();
+  }
+
   if (request.nextUrl.pathname.startsWith("/api/inlinehook")) {
     return NextResponse.next();
   }
