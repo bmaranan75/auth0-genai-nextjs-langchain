@@ -40,12 +40,25 @@ export async function POST(request: NextRequest) {
     //    ]
     // };
 
+    // const response = {
+    //    "error":[
+    //       {
+    //          "errorSummary":"Failed to deliver SMS OTP to test.user@okta.com"
+    //       },
+    //       {
+    //          "errorCauses":{
+    //             "errorSummary":"Provider could not deliver OTP",
+    //             "reason":"The content of the message is not supported",
+    //             "location":"South Africa"
+    //          }
+    //       }
+    //    ]
+    // };
+
     const response = {
        "error":[
           {
-             "errorSummary":"Failed to deliver SMS OTP to test.user@okta.com"
-          },
-          {
+             "errorSummary":"Failed to deliver SMS OTP to test.user@okta.com",
              "errorCauses":{
                 "errorSummary":"Provider could not deliver OTP",
                 "reason":"The content of the message is not supported",
