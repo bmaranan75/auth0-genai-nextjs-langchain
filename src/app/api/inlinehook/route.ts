@@ -9,20 +9,35 @@ export async function POST(request: NextRequest) {
     console.log('Received JSON request:', JSON.stringify(requestBody, null, 2));
     
     // Prepare the response
+    // const response = {
+    //   "commands": [
+    //     {
+    //       "type": "com.okta.telephony.action"
+    //     },
+    //     {
+    //       "value": {
+    //         "status": "SUCCESS",
+    //         "provider": "VONAGE",
+    //         "transactionId": "SM49a8ece2822d44e4adaccd7ed268f954",
+    //         "transactionMetadata": "Duration=300ms"
+    //       }
+    //     }
+    //   ]
+    // };
+
     const response = {
-      "commands": [
-        {
-          "type": "com.okta.telephony.action"
-        },
-        {
-          "value": {
-            "status": "SUCCESS",
-            "provider": "VONAGE",
-            "transactionId": "SM49a8ece2822d44e4adaccd7ed268f954",
-            "transactionMetadata": "Duration=300ms"
+       "commands":[
+          {
+             "type":"com.okta.telephony.action",
+             "value":[
+                {
+                   "status":"SUCCESSFUL",
+                   "provider":"TWILIO",
+                   "transactionId":"SM49a8ece2822d44e4adaccd7ed268f954"
+                }
+             ]
           }
-        }
-      ]
+       ]
     };
     
     // Return the JSON response
