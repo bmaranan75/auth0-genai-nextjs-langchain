@@ -32,7 +32,7 @@ export async function POST(request: NextRequest) {
              "value":[
                 {
                    "status":"SUCCESSFUL",
-                   "provider":"TWILIO",
+                   "provider":"SINCH",
                    "transactionId":"SM49a8ece2822d44e4adaccd7ed268f954"
                 }
              ]
