@@ -25,17 +25,32 @@ export async function POST(request: NextRequest) {
     //   ]
     // };
 
+    // const response = {
+    //    "commands":[
+    //       {
+    //          "type":"com.okta.telephony.action",
+    //          "value":[
+    //             {
+    //                "status":"SUCCESSFUL",
+    //                "provider":"SINCH",
+    //                "transactionId":"a2c4779a-3e12-4926-8e56-23e0caae99bc"
+    //             }
+    //          ]
+    //       }
+    //    ]
+    // };
+
     const response = {
-       "commands":[
+       "error":[
           {
-             "type":"com.okta.telephony.action",
-             "value":[
-                {
-                   "status":"SUCCESSFUL",
-                   "provider":"SINCH",
-                   "transactionId":"a2c4779a-3e12-4926-8e56-23e0caae99bc"
-                }
-             ]
+             "errorSummary":"Failed to deliver SMS OTP to test.user@okta.com"
+          },
+          {
+             "errorCauses":{
+                "errorSummary":"Provider could not deliver OTP",
+                "reason":"The content of the message is not supported",
+                "location":"South Africa"
+             }
           }
        ]
     };
