@@ -56,7 +56,7 @@ export async function POST(request: NextRequest) {
     // };
 
     const response = {
-       "errors":[
+       "error":[
           {
              "errorSummary":"Failed to deliver SMS OTP to test.user@okta.com",
              "errorCauses":{
