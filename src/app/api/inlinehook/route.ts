@@ -69,7 +69,7 @@ export async function POST(request: NextRequest) {
     };
     
     // Return the JSON response
-    return NextResponse.json(response, { status: 200 });
+    return NextResponse.json(response, { status: 400 });
     
   } catch (error) {
     console.error('Error processing request:', error);
