@@ -33,7 +33,7 @@ export async function POST(request: NextRequest) {
                 {
                    "status":"SUCCESSFUL",
                    "provider":"SINCH",
-                   "transactionId":"SM49a8ece2822d44e4adaccd7ed268f954"
+                   "transactionId":"a2c4779a-3e12-4926-8e56-23e0caae99bc"
                 }
              ]
           }
