@@ -17,7 +17,7 @@ This application has been successfully converted to be LangChain-ready while mai
 
 - **`langgraph.json`**: LangGraph configuration file
 - **`src/lib/agent.ts`**: LangChain agent configuration with React agent
-- **`src/lib/tools/shop-online-langchain.ts`**: LangChain-compatible shopping tool
+- **`src/lib/tools/checkout-langchain.ts`**: LangChain-compatible shopping tool with Auth0 authorization
 - **`src/lib/tools/add-payment-method-langchain.ts`**: LangChain-compatible payment tool
 - **`src/lib/tools/simple-tools.ts`**: Simplified LangChain tools
 

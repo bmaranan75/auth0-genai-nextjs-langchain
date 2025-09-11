@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { HumanMessage } from '@langchain/core/messages';
-import { graph } from '@/lib/agent';
+import { agent, createAgent } from '@/lib/agent';
 import { getUser } from '@/lib/auth0';
 import { getAuthorizationState, resetAuthorizationState } from '@/lib/auth0-ai-langchain';
 
@@ -24,16 +24,21 @@ export async function POST(req: NextRequest) {
     }
 
     try {
+      let userId = null;
       // Get the authenticated user for Auth0 AI context
       const user = await getUser();
+      userId = user?.sub;
       console.log("[chat-api] User context:", user?.sub);
       console.log("[chat-api] User message:", lastMessage.content);
       
       // Reset authorization state before processing
       resetAuthorizationState();
       
+      // Create a new agent instance with the userId
+      const agent = createAgent(userId ?? '');
+
       // Use the agent with proper Auth0 context
-      const result = await graph.invoke(
+      const result = await agent.invoke(
         {
           messages: [new HumanMessage(lastMessage.content)]
         },
@@ -43,7 +48,8 @@ export async function POST(req: NextRequest) {
             _credentials: {
               user: user
             }
-          }
+          },
+          recursionLimit: 50 // Increase from default 25 to 50
         }
       );
       
@@ -72,6 +78,18 @@ export async function POST(req: NextRequest) {
       
     } catch (agentError) {
       console.error('Agent error:', agentError);
+      
+      // Check if it's a recursion error
+      if (agentError && typeof agentError === 'object' && 'lc_error_code' in agentError) {
+        if (agentError.lc_error_code === 'GRAPH_RECURSION_LIMIT') {
+          console.error('GraphRecursionError detected. The agent may be stuck in a loop.');
+          return NextResponse.json({
+            message: "I apologize, but I encountered an issue processing your request. Please try rephrasing your question or ask for something more specific.",
+            error: "Request too complex - please simplify"
+          });
+        }
+      }
+      
       return NextResponse.json({
         message: "I'm your shopping assistant! I can help you with product recommendations and shopping. What would you like to do today?"
       });

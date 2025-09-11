@@ -15,7 +15,7 @@ export let authorizationState: {
 export const getAuthorizationState = () => {
   // Check if tool has marked auth as approved
   try {
-    const { getShopAuthState } = require('./tools/shop-online-langchain');
+    const { getShopAuthState } = require('./tools/checkout-langchain');
     const shopState = getShopAuthState();
     if (shopState?.status === 'approved' && authorizationState.status === 'requested') {
       authorizationState.status = 'approved';
@@ -30,7 +30,7 @@ export const resetAuthorizationState = () => {
   authorizationState = { status: 'idle' };
   // Also reset shop auth state
   try {
-    const { resetShopAuthState } = require('./tools/shop-online-langchain');
+    const { resetShopAuthState } = require('./tools/checkout-langchain');
     resetShopAuthState();
   } catch (e) {
     // Ignore if shop tool not available
@@ -54,16 +54,17 @@ export const withAsyncAuthorization = auth0AI.withAsyncUserConfirmation({
   audience: process.env['SHOP_API_AUDIENCE']!,
 
   /**
-   * When this flag is set to `block`, the execution of the tool awaits
-   * until the user approves or rejects the request.
+   * When this flag is set to `poll`, the tool will initiate the CIBA request
+   * and then poll for authorization completion, showing a web-based interface
+   * for user approval.
    *
-   * Given the asynchronous nature of the CIBA flow, this mode
-   * is only useful during development.
-   *
-   * In practice, the process that is awaiting the user confirmation
-   * could crash or timeout before the user approves the request.
+   * When set to `block`, the execution awaits until the user approves or rejects.
+   * However, given the asynchronous nature of the CIBA flow, polling mode 
+   * is more reliable for production use.
    */
-  onAuthorizationRequest: 'block',
+  onAuthorizationRequest: 'poll', // Changed from 'block' to 'poll'
+  pollingInterval: 2000, // Poll every 2 seconds
+  timeout: 30000, // 30 second timeout
   onUnauthorized: async (e: Error) => {
     console.error('Error:', e);
     if (e instanceof AccessDeniedInterrupt) {

@@ -58,6 +58,29 @@ async function validateAccessToken(
   });
 }
 
+async function clearUserCart(userId: string): Promise<void> {
+  try {
+    // Make internal API call to delete cart
+    const baseUrl = process.env.NEXTAUTH_URL || 'http://localhost:3000';
+    const response = await fetch(`${baseUrl}/api/delete-cart`, {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-user-id': userId, // Pass user ID in header for internal call
+      },
+    });
+
+    if (!response.ok) {
+      console.warn(`[checkout-api] Failed to clear cart for user ${userId}: ${response.status}`);
+    } else {
+      console.log(`[checkout-api] Successfully cleared cart for user ${userId}`);
+    }
+  } catch (error) {
+    console.error(`[checkout-api] Error clearing cart for user ${userId}:`, error);
+    // Don't throw error - cart clearing failure shouldn't fail the checkout
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const authHeader = req.headers.get("authorization");
@@ -120,6 +143,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Clear the user's cart after successful checkout
+    await clearUserCart(userInfo.sub);
+
+    
     // Implement your checkout logic here
     // For demonstration, just return success with the order details
     return NextResponse.json({
