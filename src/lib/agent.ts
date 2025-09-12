@@ -1,13 +1,13 @@
 import { createReactAgent, ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatOpenAI } from '@langchain/openai';
+import { RunnableConfig } from '@langchain/core/runnables';
 
 import { withAsyncAuthorization } from './auth0-ai-langchain';
-import { checkoutTool } from './tools/checkout-langchain';
+import { checkoutTool, checkoutCartTool } from './tools/checkout-langchain';
 import {browseCatalogTool} from './tools/browse-catalog-langchain';
 import { addToCartTool } from './tools/add-to-cart-langchain';
 // import { getUserCartTool } from './tools/get-user-cart-langchain';
 import { getCartTool } from './tools/get-user-cart-langchain';
-import { get } from 'http';
 
 const date = new Date().toISOString();
 
@@ -24,16 +24,23 @@ Your primary role is to assist users in finding, exploring, and purchasing groce
    - Show product listings with accurate stock status
 
 2. **Checkout Tool** (Requires Authentication) - Use this to help complete customer's purchases:
-   - Process secure checkout transactions
+   - Process secure checkout transactions for items in the user's cart
+   - ALWAYS use this tool when user requests checkout, purchase, or buy
    - Confirm order placement and provide order details
+   - This tool will trigger the authorization flow automatically
 
-3. **Add Items to Cart** - Use this when users want to add products to their cart:
+3. **Checkout Cart Tool** (Requires Authentication) - Use this to checkout the entire cart:
+   - Process checkout for all items in the user's cart at once
+   - Use when user wants to complete purchase for their entire cart
+   - This tool will trigger the authorization flow automatically
+
+4. **Add Items to Cart** - Use this when users want to add products to their cart:
    - Use immediately when users express intent to add items (e.g., "add 5 bananas", "add to cart", "I want 3 apples")
    - Input should include product id and quantity
    - This tool does NOT require authorization - use it freely for logged-in users
    - Confirm addition with a summary of the cart contents
 
-4. **Get User Cart** - Use this to retrieve the current contents of the user's shopping cart:
+5. **Get User Cart** - Use this to retrieve the current contents of the user's shopping cart:
    - Provide a summary of items in the cart including quantities and total price
    - Assist with cart management (removing items, updating quantities)
 
@@ -48,6 +55,7 @@ Your primary role is to assist users in finding, exploring, and purchasing groce
 ## Important Guidelines:
 - Always use the browse catalog tool first to check product availability and get accurate pricing
 - **When users ask to add items to cart, use the add_to_cart tool immediately - it does NOT require authorization**
+- **When users ask to checkout, buy, purchase, or complete order, ALWAYS use the checkout tool - this WILL trigger authorization**
 - Only use the checkout tool for final purchases (this requires authorization)
 - Be proactive in suggesting related or alternative products
 - Provide clear, helpful information about product details and pricing
@@ -64,6 +72,9 @@ Today is ${date}. Always use your tools to provide the most current and accurate
 const llm = new ChatOpenAI({
   model: 'gpt-4o-mini',
   temperature: 0,
+  // Optimize for serverless deployment
+  maxRetries: 2,
+  timeout: 50000, // 50 second timeout to stay within Vercel limits
 });
 
 // const tools = [
@@ -94,13 +105,15 @@ export const createAgent = (userId: string) => {
   }
 
   const tools = [
-    withAsyncAuthorization(checkoutTool),
+    // withAsyncAuthorization(checkoutTool),
+    withAsyncAuthorization(checkoutCartTool),
     browseCatalogTool,
     addToCartTool(userId), // Pass userId here
     getCartTool(userId), // Pass userId here
   ];
 
-  return createReactAgent({
+  // Create the agent with enhanced configuration for serverless deployment
+  const agent = createReactAgent({
     llm,
     tools: new ToolNode(tools, {
       // Enable error handling to prevent tool retry loops
@@ -108,10 +121,15 @@ export const createAgent = (userId: string) => {
     }),
     // Modify the stock prompt in the prebuilt agent.
     prompt: AGENT_SYSTEM_TEMPLATE,
-    // Add additional configuration to prevent infinite loops
-    checkpointSaver: false, // Disable checkpointing which might cause loops
+    // Optimize for serverless environments
+    // Note: checkpointSaver is disabled for stateless serverless functions
   });
+
+  return agent;
 };
+
+// Export the main graph for LangGraph server
+export const graph = createAgent('default-user'); // LangGraph server needs a default export
 
 // For backward compatibility, you can also export a default graph
 export const agent = createAgent(''); // Default with empty userId

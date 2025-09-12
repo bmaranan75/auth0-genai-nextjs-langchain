@@ -1,27 +1,33 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
+import { initApiPassthrough } from 'langgraph-nextjs-api-passthrough';
+import { getUser } from '@/lib/auth0';
 
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
+// Create the LangGraph API passthrough with Auth0 context
+const handler = initApiPassthrough({
+  apiUrl: 'http://127.0.0.1:8123', // Default LangGraph server URL
+  bodyParameters: async (req: NextRequest, body: any) => {
+    // Get Auth0 user context
+    const user = await getUser();
     
-    // For now, return a simple response indicating LangChain is working
-    // but we need the LangGraph server for full functionality
-    return NextResponse.json({
-      message: "LangChain implementation is ready! Start the LangGraph server with 'npm run dev:langgraph' for full functionality.",
-      received: body,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    return NextResponse.json(
-      { error: 'Failed to process request' },
-      { status: 500 }
-    );
+    // Add Auth0 user context to the request configuration
+    if (user && body.config) {
+      return {
+        ...body,
+        config: {
+          ...body.config,
+          configurable: {
+            ...body.config?.configurable,
+            user_id: user.sub,
+            _credentials: {
+              user: user
+            }
+          }
+        }
+      };
+    }
+    
+    return body;
   }
-}
+});
 
-export async function GET() {
-  return NextResponse.json({
-    status: "LangChain API Ready",
-    message: "Start LangGraph server for full functionality"
-  });
-}
+export const { GET, POST } = handler;
