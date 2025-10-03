@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getUser } from '@/lib/auth0';
-import { shopOnlineToolLangChain } from '@/lib/tools/checkout-langchain';
+import { checkoutTool } from '@/lib/tools/checkout-langchain';
+import { withAsyncAuthorization } from '@/lib/auth0-ai-langchain';
 
 export async function POST(req: NextRequest) {
   try {
@@ -28,20 +29,21 @@ export async function POST(req: NextRequest) {
     console.log('[ciba-test-api] Attempting to call shop tool with CIBA...');
     
     try {
-      // The Auth0 AI wrapper should handle CIBA authorization automatically
-      // when called from the agent context, but when called directly from API
-      // we need to provide proper context or use a different approach
+      // Create the wrapped checkout tool with CIBA authorization
+      console.log('[ciba-test-api] Creating wrapped checkout tool with CIBA...');
+      const authorizedCheckoutTool = withAsyncAuthorization(checkoutTool);
       
       console.log('[ciba-test-api] Testing CIBA with user context...');
       
-      // Try calling with user context
-      const result = await shopOnlineToolLangChain.invoke(
+      // Call the authorized tool which will handle the CIBA flow
+      const result = await authorizedCheckoutTool.invoke(
         { product, qty },
         {
           configurable: {
             user_id: user.sub,
-            // Additional context that Auth0 AI might need
-            _auth0_user: user
+            _credentials: {
+              user: user
+            }
           }
         }
       );

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { HumanMessage } from '@langchain/core/messages';
-import { createAgent } from '@/lib/agent';
+import { createAgent } from '@/lib/multi-agent';
 import { getUser } from '@/lib/auth0';
 import { getAuthorizationState, resetAuthorizationState } from '@/lib/auth0-ai-langchain';
 
@@ -45,26 +45,15 @@ export async function POST(req: NextRequest) {
       // Reset authorization state before processing
       resetAuthorizationState();
       
-      // Create a new agent instance with the userId for each request
-      // This is important for serverless functions to avoid state issues
+      // Create a new multi-agent instance with the userId for each request
+      // This uses the supervisor agent to route to specialized agents
       const agent = createAgent(userId ?? '');
 
       // Use the agent with proper Auth0 context and timeout handling
       const result = await Promise.race([
-        agent.invoke(
-          {
-            messages: [new HumanMessage(lastMessage.content)]
-          },
-          {
-            configurable: {
-              user_id: user?.sub,
-              _credentials: {
-                user: user
-              }
-            },
-            recursionLimit: 50 // Increase from default 25 to 50
-          }
-        ),
+        agent.invoke({
+          messages: [new HumanMessage(lastMessage.content)]
+        }),
         // Add timeout protection for Vercel
         new Promise((_, reject) => 
           setTimeout(() => reject(new Error('Request timeout')), 55000) // 55s timeout

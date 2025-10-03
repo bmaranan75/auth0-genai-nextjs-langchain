@@ -63,21 +63,31 @@ export const withAsyncAuthorization = auth0AI.withAsyncUserConfirmation({
    * and then call this function with the authorization request and polling promise.
    */
   onAuthorizationRequest: async (authReq, poll) => {
-    console.log('Authorization request initiated:', authReq);
+    console.log('[auth0-ai] Authorization request initiated:', authReq);
+    console.log('[auth0-ai] Auth request:', JSON.stringify(authReq, null, 2));
     traceAuthorizationEvent('request', undefined, { authReq });
     
-    // Poll for the result
+    // Update status to pending
+    authorizationState.status = 'pending';
+    
+    // Poll for the result - this should wait for actual user approval
     try {
+      console.log('[auth0-ai] Starting to poll for user authorization...');
       const result = await poll;
+      console.log('[auth0-ai] Polling completed with result:', result);
+      
       if (result) {
         authorizationState.status = 'approved';
+        console.log('[auth0-ai] Authorization APPROVED');
         traceAuthorizationEvent('approved', undefined, { result });
       } else {
         authorizationState.status = 'denied';
+        console.log('[auth0-ai] Authorization DENIED - no result returned');
         traceAuthorizationEvent('denied', undefined, { reason: 'No result returned' });
       }
     } catch (error) {
       authorizationState.status = 'denied';
+      console.error('[auth0-ai] Authorization DENIED - polling error:', error);
       traceAuthorizationEvent('denied', undefined, { error });
       throw error;
     }
@@ -106,3 +116,6 @@ export const withAsyncAuthorization = auth0AI.withAsyncUserConfirmation({
     return e.message;
   },
 });
+
+// Export alias for payment-specific authorization (backward compatibility)
+export const withAsyncPaymentAuthorizationLangChain = withAsyncAuthorization;
