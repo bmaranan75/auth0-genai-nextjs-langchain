@@ -21,12 +21,15 @@ export function withManualCIBAAuthorization<T extends Record<string, any>>(
       console.log("[manual-ciba] User authenticated:", user.sub);
       
       try {
-        // Step 1: Initiate CIBA request
+        // Step 1: Initiate CIBA request - create safe binding message
+        const safeArgs = typeof args === 'object' ? Object.keys(args).join(' ') : String(args);
+        const bindingMessage = `Approve checkout: ${safeArgs.replace(/[^a-zA-Z0-9\s+\-_.,:#]/g, '')}`;
+        
         const cibaResponse = await initiateCIBARequest({
           userSub: user.sub,
           scopes,
           audience,
-          bindingMessage: `Approve: ${JSON.stringify(args)}`,
+          bindingMessage,
         });
         
         console.log("[manual-ciba] CIBA request initiated:", cibaResponse.auth_req_id);
@@ -53,7 +56,9 @@ export function withManualCIBAAuthorization<T extends Record<string, any>>(
       } catch (error) {
         console.error("[manual-ciba] Authorization failed:", error);
         const errorMessage = error instanceof Error ? error.message : String(error);
-        throw new Error(`Authorization failed: ${errorMessage}`);
+        
+        // Return a clear failure message instead of throwing to prevent retries
+        return `Authorization failed: ${errorMessage}. Please try again later.`;
       }
     },
     {

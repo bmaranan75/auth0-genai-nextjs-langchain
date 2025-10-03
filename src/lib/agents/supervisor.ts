@@ -65,8 +65,27 @@ async function catalogCartNode(state: typeof SupervisorState.State) {
   const { messages, userId } = state;
   const agent = createCatalogCartAgent(userId || 'default-user');
   
-  console.log('[catalogCartNode] Processing with catalog/cart agent');
-  const result = await agent.invoke({ messages });
+  console.log('[catalogCartNode] Processing with catalog/cart agent for user:', userId);
+  
+  // Pass proper configuration with user credentials
+  const { getUser } = require('../auth0');
+  let userObj = null;
+  try {
+    userObj = await getUser();
+  } catch (e) {
+    console.log('[catalogCartNode] Could not get user object, using userId only');
+  }
+  
+  const config = {
+    configurable: {
+      user_id: userId,
+      _credentials: {
+        user: userObj || { sub: userId }
+      }
+    }
+  };
+  
+  const result = await agent.invoke({ messages }, config);
   
   return {
     messages: result.messages,
@@ -78,8 +97,28 @@ async function paymentCheckoutNode(state: typeof SupervisorState.State) {
   const { messages, userId } = state;
   const agent = createPaymentCheckoutAgent(userId || 'default-user');
   
-  console.log('[paymentCheckoutNode] Processing with payment/checkout agent');
-  const result = await agent.invoke({ messages });
+  console.log('[paymentCheckoutNode] Processing with payment/checkout agent for user:', userId);
+  
+  // Pass proper configuration with user credentials for Auth0 CIBA
+  // We need to get the full user object for proper CIBA authorization
+  const { getUser } = require('../auth0');
+  let userObj = null;
+  try {
+    userObj = await getUser();
+  } catch (e) {
+    console.log('[paymentCheckoutNode] Could not get user object, using userId only');
+  }
+  
+  const config = {
+    configurable: {
+      user_id: userId,
+      _credentials: {
+        user: userObj || { sub: userId }
+      }
+    }
+  };
+  
+  const result = await agent.invoke({ messages }, config);
   
   return {
     messages: result.messages,

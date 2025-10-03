@@ -43,15 +43,45 @@ export const withAsyncAuthorization = auth0AI.withAsyncUserConfirmation({
   userID: async (_params, config) => {
     return config?.configurable?._credentials?.user?.sub;
   },
-  bindingMessage: async ({ product, qty }) => {
-    const message = `Do you want to buy ${qty} ${product}`;
+  bindingMessage: async (params) => {
+    let message: string;
+    
+    // Handle different parameter formats for different tools
+    if (params.product && params.qty) {
+      // Individual product checkout
+      message = `Do you want to buy ${params.qty} ${params.product}`;
+    } else if (params.cartSummary) {
+      // Cart checkout - create safe binding message with only allowed characters
+      let cartInfo = params.cartSummary;
+      try {
+        const parsed = typeof params.cartSummary === 'string' ? JSON.parse(params.cartSummary) : params.cartSummary;
+        if (parsed.totalValue && parsed.items) {
+          const itemCount = Array.isArray(parsed.items) ? parsed.items.length : 'multiple';
+          message = `Do you want to checkout cart with ${itemCount} items for ${parsed.totalValue}`;
+        } else if (parsed.summary) {
+          // Clean the summary to only include allowed characters
+          const cleanSummary = parsed.summary.replace(/[^a-zA-Z0-9\s+\-_.,:#]/g, '');
+          message = `Do you want to checkout cart: ${cleanSummary}`;
+        } else {
+          message = `Do you want to checkout your cart`;
+        }
+      } catch {
+        // Clean cart info to only include allowed characters
+        const cleanCartInfo = cartInfo.replace(/[^a-zA-Z0-9\s+\-_.,:#]/g, '');
+        message = `Do you want to checkout cart: ${cleanCartInfo}`;
+      }
+    } else {
+      // Fallback for other parameters
+      message = `Do you want to proceed with this purchase`;
+    }
+    
     authorizationState = {
       status: 'requested',
       message
     };
     
     // Trace authorization request
-    traceAuthorizationEvent('request', undefined, { product, qty, message });
+    traceAuthorizationEvent('request', undefined, { params, message });
     
     return message;
   },

@@ -49,7 +49,7 @@ export async function POST(req: NextRequest) {
       // This uses the supervisor agent to route to specialized agents
       const agent = createAgent(userId ?? '');
 
-      // Use the agent with proper Auth0 context and timeout handling
+      // Use the agent with proper Auth0 context and timeout handling  
       const result = await Promise.race([
         agent.invoke({
           messages: [new HumanMessage(lastMessage.content)]
