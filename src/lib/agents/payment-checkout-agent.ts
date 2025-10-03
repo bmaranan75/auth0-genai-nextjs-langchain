@@ -1,9 +1,8 @@
 import { createReactAgent, ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatOpenAI } from '@langchain/openai';
 import { withAsyncAuthorization } from '../auth0-ai-langchain';
-import { checkoutCartTool } from '../tools/checkout-langchain';
+import { createCheckoutCartTool } from '../tools/checkout-langchain-refactored';
 import { addPaymentMethodToolLangChain } from '../tools/add-payment-method-langchain';
-import { getCartTool } from '../tools/get-user-cart-langchain';
 import { withManualCIBAAuthorization } from '../manual-ciba-langchain';
 
 const date = new Date().toISOString();
@@ -29,19 +28,13 @@ You MUST use tools for ALL checkout operations.
 1. **checkout_cart** - Your MANDATORY checkout tool:
    - **YOU MUST CALL THIS TOOL for ANY checkout request**
    - Function name: checkout_cart
-   - Required parameter: cartSummary (string describing the cart contents)
-   - Example usage: checkout_cart(cartSummary="customer's shopping cart items")
+   - Required parameter: cartData (structured cart object with items and details)
+   - The cart data is automatically provided by the supervisor from the catalog agent
    - This tool will trigger the Auth0 CIBA authorization flow with push notifications
    - The tool handles all the authorization and payment processing
-   - Always call this tool first when user wants to checkout
+   - Always call this tool when user wants to checkout
 
-2. **get_cart** - Get current cart contents:
-   - Use this tool FIRST to retrieve the user's current cart before checkout
-   - Function name: get_cart
-   - No parameters needed
-   - Returns cart contents that you'll use in the checkout_cart tool
-
-3. **Add Payment Method Tool** (Requires Authentication) - For payment setup:
+2. **Add Payment Method Tool** (Requires Authentication) - For payment setup:
    - Add new payment methods to user accounts
    - Manage payment method information securely
    - Required before checkout if no payment method exists
@@ -59,8 +52,8 @@ You MUST use tools for ALL checkout operations.
 - **ANY mention of checkout, purchase, buy, complete order = MUST USE TOOLS**
 
 ## Tool Execution Sequence for Checkout:
-1. **ALWAYS call get_cart first** to get current cart contents
-2. **ALWAYS call checkout_cart second** with the cart data from step 1
+1. **Cart data is automatically provided** by the supervisor from the catalog agent
+2. **CALL checkout_cart** with the provided cart data
 3. **WAIT for checkout_cart tool response** - let it complete the CIBA flow
 4. **ANALYZE the actual tool response** - success, failure, or authorization status
 5. **RESPOND based on the REAL results** from the checkout_cart tool
@@ -83,8 +76,8 @@ You MUST use tools for ALL checkout operations.
 
 When user says: "checkout", "purchase", "buy", "complete order", or similar:
 
-STEP 1: Use get_cart tool (no parameters)
-STEP 2: Use checkout_cart tool (with cart summary from step 1)
+STEP 1: Cart data is automatically provided by the supervisor (no tool call needed)
+STEP 2: Use checkout_cart tool with the provided cart data
 STEP 3: WAIT for the checkout_cart tool to complete and return results
 STEP 4: Based on the ACTUAL tool response, provide appropriate feedback to user
 
@@ -135,8 +128,8 @@ Respond with: "I'll transfer you to our Catalog & Cart specialist to help with p
 
 ## FINAL REMINDER - CRITICAL:
 If the user mentions checkout, purchase, buy, or complete order:
-- You MUST call get_cart tool first
-- You MUST call checkout_cart tool second
+- Cart data is automatically provided by the supervisor
+- You MUST call checkout_cart tool with the provided cart data
 - You CANNOT just respond with text about checkout
 - Tool usage is MANDATORY, not optional
 
@@ -161,12 +154,17 @@ const llm = new ChatOpenAI({
   }
 });
 
-export const createPaymentCheckoutAgent = (userId: string) => {
+export const createPaymentCheckoutAgent = (userId: string, cartData?: any) => {
   console.log('[createPaymentCheckoutAgent] Creating payment/checkout agent for userId:', userId);
+  console.log('[createPaymentCheckoutAgent] Cart data provided:', !!cartData);
+  
+  // Create checkout tool with cart data if provided
+  const checkoutTool = cartData 
+    ? withAsyncAuthorization(createCheckoutCartTool(cartData))
+    : withAsyncAuthorization(createCheckoutCartTool({}));
   
   const tools = [
-    getCartTool(userId), // Get current cart contents
-    withAsyncAuthorization(checkoutCartTool), // Back to original wrapper but with fixed binding message
+    checkoutTool, // Checkout tool with Auth0 CIBA authorization and cart data
     addPaymentMethodToolLangChain, // Already wrapped with authorization
   ];
 
@@ -182,4 +180,4 @@ export const createPaymentCheckoutAgent = (userId: string) => {
 };
 
 // Export for LangGraph server
-export const paymentCheckoutGraph = createPaymentCheckoutAgent('default-user');
+export const paymentCheckoutGraph = createPaymentCheckoutAgent('default-user', {});

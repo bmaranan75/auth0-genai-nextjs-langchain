@@ -17,6 +17,76 @@ export const resetShopAuthState = () => {
   authorizationState = null;
 };
 
+// Create a dynamic checkout tool that gets cart data from configuration
+export const createCheckoutCartTool = (cartData: any) => tool(
+  async ({}) => {
+    console.log(`[checkout-cart-tool] Processing cart checkout with provided cart data`);
+    console.log(`[checkout-cart-tool] Cart data:`, cartData);
+
+    const apiUrl = process.env['SHOP_API_URL'] || 'http://localhost:3000/api/checkout';
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    
+    // Use cart data provided during tool creation
+    const processedCartData = cartData || {};
+
+    const body = {
+      action: 'checkout_cart',
+      cart: processedCartData,
+    };
+
+    // The withAsyncAuthorization wrapper will provide the access token through CIBA credentials
+    const credentials = getCIBACredentials();
+    const accessToken = credentials?.accessToken;
+
+    console.log(`[checkout-cart-tool] Access token available: ${!!accessToken}`);
+
+    if (accessToken) {
+      headers['Authorization'] = `Bearer ${accessToken}`;
+      console.log(`[checkout-cart-tool] Using access token: ${accessToken.substring(0, 20)}...`);
+      
+      // Mark authorization as approved since we have valid credentials
+      setAuthorizationApproved();
+    }
+
+    console.log(`[checkout-cart-tool] Making API call to: ${apiUrl}`);
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(body),
+    });
+
+    console.log(`[checkout-cart-tool] API response status: ${response.status}`);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[checkout-cart-tool] API error: ${response.status} - ${errorText}`);
+      
+      if (!apiUrl.includes('localhost:3000')) {
+        throw new Error(`Checkout failed: ${response.status} - ${errorText}`);
+      } else {
+        // Mock response for local testing
+        const totalValue = processedCartData?.totalValue || processedCartData?.total || 0;
+        return `Successfully processed checkout for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}. Order has been placed and will be processed for delivery.`;
+      }
+    }
+
+    const result = await response.text();
+    console.log(`[checkout-cart-tool] API response: ${result}`);
+    return result || `Successfully processed your cart checkout.`;
+  },
+  {
+    name: 'checkout_cart',
+    description: 'Tool to checkout the entire shopping cart. Use this tool when the user wants to purchase, buy, checkout, or complete their order for all items in their cart. This tool requires user authorization and will trigger the CIBA authentication flow. Cart data is automatically provided from the supervisor.',
+    schema: z.object({
+      // No parameters needed - cart data comes from tool creation
+    }),
+  },
+);
+
+// Original checkout tool for backwards compatibility
 export const checkoutCartTool = tool(
   async ({ cartData }) => {
     console.log(`[checkout-cart-tool] Processing cart checkout with structured cart data`);
@@ -67,8 +137,8 @@ export const checkoutCartTool = tool(
         throw new Error(`Checkout failed: ${response.status} - ${errorText}`);
       } else {
         // Mock response for local testing
-        const totalValue = cartData?.totalValue || 0;
-        return `Successfully processed checkout for cart totaling $${totalValue.toFixed(2)}. Order has been placed and will be processed for delivery.`;
+        const totalValue = processedCartData?.totalValue || processedCartData?.total || 0;
+        return `Successfully processed checkout for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}. Order has been placed and will be processed for delivery.`;
       }
     }
 
