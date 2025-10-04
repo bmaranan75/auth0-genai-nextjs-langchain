@@ -3,7 +3,8 @@
   "graphs": {
     "supervisor": "./src/lib/agents/supervisor.ts:supervisorGraph",
     "catalog_cart": "./src/lib/agents/catalog-cart-agent.ts:catalogCartGraph",
-    "payment_checkout": "./src/lib/agents/payment-checkout-agent.ts:paymentCheckoutGraph"
+    "payment_checkout": "./src/lib/agents/payment-checkout-agent.ts:paymentCheckoutGraph",
+    "deals": "./src/lib/agents/deals-agent.ts:dealsGraph"
   },
   "env": ".env.local",
   "node_version": "20"
