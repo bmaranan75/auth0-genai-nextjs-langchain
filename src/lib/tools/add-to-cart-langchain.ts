@@ -1,4 +1,5 @@
 import { DynamicTool } from '@langchain/core/tools';
+import { parseCartInput, formatToolResponse, logToolExecution } from './robust-tool-parser';
 
 export const addToCartTool = (userId: string) => new DynamicTool({
   name: 'add_to_cart',
@@ -16,19 +17,23 @@ export const addToCartTool = (userId: string) => new DynamicTool({
     Use this tool immediately when users express intent to add items to their cart.
   `,
   func: async (inputString) => {
+    const startTime = Date.now();
+    
     try {
       console.log(`[addToCartTool] Called with userId: ${userId}, input: ${inputString}`);
       
-      // Parse the input string to get the cart item data
-      let input;
-      try {
-        input = JSON.parse(inputString);
-      } catch (parseError) {
-        console.error('Error parsing input:', parseError);
-        return JSON.stringify({
-          success: false,
-          error: 'Invalid JSON input. Please provide a valid JSON string.',
-        });
+      // Use robust parser for input handling
+      const parseResult = parseCartInput(inputString);
+      
+      if (!parseResult.success) {
+        return formatToolResponse(false, null, parseResult.error);
+      }
+      
+      let input = parseResult.data;
+      
+      // Handle empty input
+      if (!input.productCode && !input.productName) {
+        return formatToolResponse(false, null, 'No product specified to add to cart.');
       }
 
       // Transform id to productCode if needed (for backward compatibility with agent)
@@ -40,12 +45,9 @@ export const addToCartTool = (userId: string) => new DynamicTool({
 
       console.log('[addToCartTool] Input after transformation:', input);
 
-      // Validate required fields - use productCode as expected by the API
+      // Additional validation after parsing
       if (!input.productCode && !input.productName) {
-        return JSON.stringify({
-          success: false,
-          error: 'Either productCode or productName is required',
-        });
+        return formatToolResponse(false, null, 'Either productCode or productName is required');
       }
 
       // Set defaults and add userId
@@ -74,19 +76,25 @@ export const addToCartTool = (userId: string) => new DynamicTool({
 
       console.log('[addToCartTool] Item added successfully:', result);
       
-      return JSON.stringify({
-        success: true,
+      const toolResult = {
         message: result.message,
         cartItem: result.cartItem,
         totalItems: result.totalItems,
-      });
+      };
+
+      const duration = Date.now() - startTime;
+      logToolExecution('addToCartTool', inputString, { success: true }, duration);
+      
+      return formatToolResponse(true, toolResult);
       
     } catch (error) {
       console.error('[addToCartTool] Error adding item to cart:', error);
-      return JSON.stringify({
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error occurred',
-      });
+      const duration = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      
+      logToolExecution('addToCartTool', inputString, { success: false, error: errorMessage }, duration);
+      
+      return formatToolResponse(false, null, errorMessage);
     }
   },
 });

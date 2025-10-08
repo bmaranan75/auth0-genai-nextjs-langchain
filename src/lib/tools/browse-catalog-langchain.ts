@@ -1,37 +1,33 @@
-import { DynamicTool } from '@langchain/core/tools';
+import { DynamicStructuredTool } from '@langchain/core/tools';
+import { z } from 'zod';
+import { parseCatalogInput, formatToolResponse, logToolExecution } from './robust-tool-parser';
 
-export const browseCatalogTool = new DynamicTool({
+// Define schema with proper nullable() for optional fields to fix OpenAI structured outputs warning
+const browseCatalogSchema = z.object({
+  search: z.string().nullable().optional().describe('Search term to find products by name or category'),
+  category: z.string().nullable().optional().describe('Filter by specific category (e.g., "Produce", "Dairy", "Seafood")'),
+  limit: z.number().nullable().optional().describe('Number of products to return (default: 10, max: 20)'),
+  offset: z.number().nullable().optional().describe('Number of products to skip for pagination (default: 0)')
+});
+
+export const browseCatalogTool = new DynamicStructuredTool({
   name: 'browse_catalog',
-
   description: `
     Browse and search the product catalog. This tool helps users discover products before adding them to cart.
-    Input should be a JSON string with optional fields:
-    - search (optional): Search term to find products by id or category
-    - category (optional): Filter by specific category (e.g., "Produce", "Dairy", "Seafood")
-    - limit (optional): Number of products to return (default: 10, max: 20)
-    - offset (optional): Number of products to skip for pagination (default: 0)
     
-    Example inputs:
-    - '{}' - Get all products
-    - '{"search": "apples"}' - Search for apples
-    - '{"category": "Produce"}' - Get produce products
-    - '{"search": "apples", "limit": 5}' - Search for apples, limit to 5 results
+    Optional parameters:
+    - search: Search term to find products by name or category
+    - category: Filter by specific category (e.g., "Produce", "Dairy", "Seafood")  
+    - limit: Number of products to return (default: 10, max: 20)
+    - offset: Number of products to skip for pagination (default: 0)
 
     This tool does not require authentication and can be used to help users discover products.
   `,
-  func: async (inputString) => {
+  schema: browseCatalogSchema,
+  func: async (input) => {
+    const startTime = Date.now();
+    
     try {
-      // Parse the input string
-      let input;
-      try {
-        input = JSON.parse(inputString);
-      } catch (parseError) {
-        return JSON.stringify({
-          success: false,
-          error: 'Invalid JSON input. Please provide a valid JSON string.',
-        });
-      }
-
       console.log('[browseCatalogTool] Browsing catalog with filters:', input);
       
       // Build query parameters
@@ -61,20 +57,26 @@ export const browseCatalogTool = new DynamicTool({
         description: product.description
       }));
 
-      return JSON.stringify({
-        success: true,
+      const toolResult = {
         message: `Found ${result.products.length} products${input.search ? ` matching "${input.search}"` : ''}${input.category ? ` in ${input.category} category` : ''}. Here are the products available:`,
         products: formattedProducts,
         totalProducts: result.pagination.total,
-        completed: true // Add a completion flag
-      });
+        completed: true
+      };
+
+      const duration = Date.now() - startTime;
+      logToolExecution('browseCatalogTool', JSON.stringify(input), { success: true }, duration);
+
+      return formatToolResponse(true, toolResult);
 
     } catch (error) {
       console.error('[browseCatalogTool] Error browsing catalog:', error);
-      return JSON.stringify({
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error occurred',
-      });
+      const duration = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      
+      logToolExecution('browseCatalogTool', JSON.stringify(input), { success: false, error: errorMessage }, duration);
+      
+      return formatToolResponse(false, null, errorMessage);
     }
   },
 });

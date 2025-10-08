@@ -147,7 +147,7 @@ export const checkoutTool = tool(
     schema: z.object({
       product: z.string().describe('The product name to purchase'),
       qty: z.number().describe('The quantity to purchase'),
-      priceLimit: z.number().optional().describe('Optional price limit for the purchase'),
+      priceLimit: z.number().nullable().optional().describe('Optional price limit for the purchase'),
     }),
   },
 );

@@ -123,12 +123,12 @@ const baseTool = tool(
     description: "Tool to add a new payment method with human-in-the-loop authorization",
     schema: z.object({
       type: z.enum(["credit_card", "debit_card", "bank_account", "paypal"]).describe("Type of payment method"),
-      cardNumber: z.string().optional().describe("Card number (for card types)"),
-      expiryDate: z.string().optional().describe("Expiry date in MM/YY format (for card types)"),
-      accountNumber: z.string().optional().describe("Account number (for bank account)"),
-      routingNumber: z.string().optional().describe("Routing number (for bank account)"),
-      email: z.string().optional().describe("Email address (for PayPal)"),
-      isDefault: z.boolean().optional().describe("Set as default payment method"),
+      cardNumber: z.string().nullable().optional().describe("Card number (for card types)"),
+      expiryDate: z.string().nullable().optional().describe("Expiry date in MM/YY format (for card types)"),
+      accountNumber: z.string().nullable().optional().describe("Account number (for bank account)"),
+      routingNumber: z.string().nullable().optional().describe("Routing number (for bank account)"),
+      email: z.string().nullable().optional().describe("Email address (for PayPal)"),
+      isDefault: z.boolean().nullable().optional().describe("Set as default payment method"),
     }),
   }
 );

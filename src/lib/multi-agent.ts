@@ -10,6 +10,7 @@ export const createAgent = createSupervisorAgent;
 export { supervisorGraph as graph } from './agents/supervisor';
 
 // Also export individual agents for direct access if needed
-export { createCatalogCartAgent } from './agents/catalog-cart-agent';
-export { createPaymentCheckoutAgent } from './agents/payment-checkout-agent';
+export { createCatalogAgent, createCatalogCartAgent } from './agents/catalog-agent';
+export { createCartAndCheckoutAgent } from './agents/cart-and-checkout-agent';
+export { createPaymentAgent } from './agents/payment-agent';
 export { createSupervisorAgent } from './agents/supervisor';

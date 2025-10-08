@@ -1,5 +1,6 @@
 import { createReactAgent, ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatOpenAI } from '@langchain/openai';
+import { MemorySaver } from '@langchain/langgraph';
 import { checkProductDealsTool, confirmDealUsageTool } from '../tools/deals-langchain';
 
 const date = new Date().toISOString();
@@ -85,24 +86,84 @@ const llm = new ChatOpenAI({
   timeout: 50000,
 });
 
+export class DealsAgent {
+  private agent: any;
+  private memorySaver: MemorySaver;
+  private userId: string;
+
+  constructor(userId: string) {
+    console.log('[DealsAgent] Creating agent for userId:', userId);
+    
+    this.userId = userId;
+    this.memorySaver = new MemorySaver();
+    
+    const tools = [
+      checkProductDealsTool,
+      confirmDealUsageTool,
+    ];
+
+    this.agent = createReactAgent({
+      llm,
+      tools: new ToolNode(tools, { handleToolErrors: true }),
+      prompt: DEALS_SYSTEM_TEMPLATE,
+      checkpointer: this.memorySaver,
+    });
+  }
+
+  // Standalone usage - can be called by any system
+  async chat(message: string, sessionId?: string): Promise<any> {
+    const threadId = sessionId || `deals-${this.userId}-default`;
+    const config = { configurable: { thread_id: threadId } };
+    
+    return await this.agent.invoke({
+      messages: [{ role: 'user', content: message }]
+    }, config);
+  }
+
+  // Stream support for real-time responses
+  async stream(message: string, sessionId?: string) {
+    const threadId = sessionId || `deals-${this.userId}-default`;
+    const config = { configurable: { thread_id: threadId } };
+    
+    return this.agent.stream({
+      messages: [{ role: 'user', content: message }]
+    }, config);
+  }
+
+  // Get conversation history
+  async getHistory(sessionId?: string) {
+    const threadId = sessionId || `deals-${this.userId}-default`;
+    const config = { configurable: { thread_id: threadId } };
+    return await this.memorySaver.get(config);
+  }
+
+  // Clear session memory
+  async clearSession(sessionId?: string) {
+    const threadId = sessionId || `deals-${this.userId}-default`;
+    this.memorySaver = new MemorySaver();
+    console.log(`[DealsAgent] Session ${threadId} cleared`);
+  }
+
+  // Supervisor-compatible method (for existing integration)
+  async invoke(input: any, config?: any) {
+    return await this.agent.invoke(input, config);
+  }
+}
+
+// Factory function for backward compatibility
 export const createDealsAgent = (userId: string) => {
-  console.log('[createDealsAgent] Creating deals agent for userId:', userId);
-  
-  const tools = [
-    checkProductDealsTool,
-    confirmDealUsageTool,
-  ];
-
-  const agent = createReactAgent({
-    llm,
-    tools: new ToolNode(tools, {
-      handleToolErrors: true,
-    }),
-    prompt: DEALS_SYSTEM_TEMPLATE,
-  });
-
-  return agent;
+  return new DealsAgent(userId);
 };
 
-// Export for LangGraph server
-export const dealsGraph = createDealsAgent('default-user');
+// Create a standalone graph instance for LangGraph server deployment
+const serverTools = [
+  checkProductDealsTool,
+  confirmDealUsageTool,
+];
+
+export const dealsGraph = createReactAgent({
+  llm,
+  tools: new ToolNode(serverTools, { handleToolErrors: true }),
+  prompt: DEALS_SYSTEM_TEMPLATE,
+  checkpointer: new MemorySaver(),
+});

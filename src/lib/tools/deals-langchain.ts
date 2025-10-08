@@ -44,7 +44,7 @@ const CURRENT_WEEK_DEALS = {
 
 const checkProductDealsSchema = z.object({
   productName: z.string().describe('The name of the product to check for deals'),
-  quantity: z.number().optional().describe('Optional quantity the user wants to purchase'),
+  quantity: z.number().nullable().optional().describe('Optional quantity the user wants to purchase'),
 });
 
 export const checkProductDealsTool = new DynamicStructuredTool({

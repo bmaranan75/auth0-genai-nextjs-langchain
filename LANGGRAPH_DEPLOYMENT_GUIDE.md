@@ -5,8 +5,8 @@
 This project now contains a multi-agent LangGraph system with three deployable agents:
 
 1. **Supervisor Agent** (`supervisor`) - Routes requests to specialized agents
-2. **Catalog/Cart Agent** (`catalog_cart`) - Handles product discovery and cart management  
-3. **Payment/Checkout Agent** (`payment_checkout`) - Handles payments and order completion
+2. **Catalog/Cart Agent** (`catalog_cart`) - Handles product discovery and cart management
+3. **Payment Agent** (`payment`) - Handles payment method management and setup only
 
 ## Architecture
 
@@ -19,6 +19,7 @@ User Request → Supervisor Agent → Routes to:
 ## Prerequisites
 
 1. **LangGraph CLI**: Install globally
+
    ```bash
    npm install -g @langchain/langgraph-cli
    ```
@@ -59,8 +60,8 @@ Deploy specific agents separately:
 # Deploy only catalog/cart agent
 langgraph deploy --graph catalog_cart --wait
 
-# Deploy only payment/checkout agent  
-langgraph deploy --graph payment_checkout --wait
+# Deploy only payment/checkout agent
+langgraph deploy --graph payment --wait
 
 # Deploy supervisor agent
 langgraph deploy --graph supervisor --wait
@@ -75,8 +76,9 @@ The `langgraph.json` is configured with:
   "dependencies": ["."],
   "graphs": {
     "supervisor": "./src/lib/agents/supervisor.ts:supervisorGraph",
-    "catalog_cart": "./src/lib/agents/catalog-cart-agent.ts:catalogCartGraph", 
-    "payment_checkout": "./src/lib/agents/payment-checkout-agent.ts:paymentCheckoutGraph"
+    "catalog": "./src/lib/agents/catalog-agent.ts:catalogGraph",
+    "cart_and_checkout": "./src/lib/agents/cart-and-checkout-agent.ts:cartAndCheckoutGraph",
+    "payment": "./src/lib/agents/payment-agent.ts:paymentGraph"
   },
   "env": ".env.local",
   "node_version": "20"
@@ -101,7 +103,7 @@ curl -X POST "http://localhost:8000/runs/stream" \
 curl -X POST "http://localhost:8000/runs/stream" \
   -H "Content-Type: application/json" \
   -d '{
-    "assistant_id": "payment_checkout", 
+    "assistant_id": "payment",
     "input": {"messages": [{"role": "user", "content": "I want to checkout"}]},
     "stream_mode": "values"
   }'
@@ -172,16 +174,19 @@ SHOP_API_URL=https://your-prod-api.com/api
 ## Agent Capabilities
 
 ### Catalog/Cart Agent
+
 - **Tools**: `browse_catalog`, `add_to_cart`, `get_user_cart`
 - **Use Cases**: Product search, browsing, cart management
 - **No Authentication Required**: For browsing and cart operations
 
-### Payment/Checkout Agent  
+### Payment/Checkout Agent
+
 - **Tools**: `checkout_cart`, `add_payment_method`
 - **Use Cases**: Order completion, payment processing
 - **Authentication Required**: Uses Auth0 CIBA flow
 
 ### Supervisor Agent
+
 - **Routing Logic**: Analyzes user intent and routes to appropriate agent
 - **Fallback**: Defaults to catalog/cart agent for ambiguous requests
 
@@ -193,26 +198,31 @@ The existing Next.js API routes continue to work unchanged. The multi-agent syst
 // The API automatically uses the supervisor agent
 const agent = createAgent(userId);
 const result = await agent.invoke({
-  messages: [new HumanMessage(userMessage)]
+  messages: [new HumanMessage(userMessage)],
 });
 ```
 
 ## Monitoring and Debugging
 
 ### LangGraph Studio
+
 Access the visual debugging interface:
+
 ```bash
 langgraph dev
 # Visit http://localhost:8000/studio
 ```
 
 ### Logging
+
 Each agent includes detailed logging:
+
 ```typescript
 console.log('[agentName] Processing request:', input);
 ```
 
 ### Error Handling
+
 - Built-in tool error handling
 - Timeout protection (55s for Vercel compatibility)
 - Authorization error recovery
@@ -220,11 +230,13 @@ console.log('[agentName] Processing request:', input);
 ## Scaling Considerations
 
 ### Horizontal Scaling
+
 - Each agent can be scaled independently
 - Supervisor handles load distribution
 - Stateless design for serverless deployment
 
 ### Performance Optimization
+
 - 50s timeout for serverless compatibility
 - Tool error handling to prevent retry loops
 - Optimized LLM settings (gpt-4o-mini, temperature=0)
@@ -232,6 +244,7 @@ console.log('[agentName] Processing request:', input);
 ## Migration from Single Agent
 
 The deployment maintains backward compatibility:
+
 - Existing API routes work unchanged
 - UI components continue to function
 - Same authentication flow
@@ -242,12 +255,14 @@ The deployment maintains backward compatibility:
 ### Common Issues
 
 1. **Agent Not Found**
+
    ```bash
    # Verify graphs are properly exported
    langgraph build --check
    ```
 
 2. **Tool Import Errors**
+
    ```bash
    # Check tool exports
    npm run type-check

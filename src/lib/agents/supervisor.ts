@@ -1,9 +1,10 @@
 import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages';
-import { createCatalogCartAgent } from './catalog-cart-agent';
-import { createPaymentCheckoutAgent } from './payment-checkout-agent';
-import { createDealsAgent } from './deals-agent';
+import { CatalogAgent } from './catalog-agent';
+import { CartAndCheckoutAgent } from './cart-and-checkout-agent';
+import { PaymentAgent } from './payment-agent';
+import { DealsAgent } from './deals-agent';
 
 // Define the state structure
 const SupervisorState = Annotation.Root({
@@ -98,20 +99,20 @@ async function supervisor(state: typeof SupervisorState.State) {
   
   // Multi-step checkout workflow handling
   if (isCheckoutIntent(lastMessage.content) && !cartData) {
-    console.log('[supervisor] Checkout intent detected, routing to catalog_cart to prepare cart data');
+    console.log('[supervisor] Checkout intent detected, routing to cart_and_checkout to prepare cart data');
     return {
-      next: 'catalog_cart',
+      next: 'cart_and_checkout',
       userId,
       workflowContext: 'prepare_checkout',
       messages: []
     };
   }
   
-  // If we have cart data and checkout context, proceed to payment
+  // If we have cart data and checkout context, proceed to cart_and_checkout for final processing
   if (cartData && workflowContext === 'prepare_checkout') {
-    console.log('[supervisor] Cart data prepared, routing to payment_checkout');
+    console.log('[supervisor] Cart data prepared, routing to cart_and_checkout for final checkout');
     return {
-      next: 'payment_checkout',
+      next: 'cart_and_checkout',
       userId,
       workflowContext: 'process_checkout',
       cartData,
@@ -135,11 +136,11 @@ async function supervisor(state: typeof SupervisorState.State) {
     }
   }
   
-  // After deals check, route to catalog_cart for actual add-to-cart
+  // After deals check, route to cart_and_checkout for actual add-to-cart
   if (workflowContext === 'check_deals_complete') {
-    console.log('[supervisor] Deals check complete, routing to catalog_cart for add-to-cart');
+    console.log('[supervisor] Deals check complete, routing to cart_and_checkout for add-to-cart');
     return {
-      next: 'catalog_cart',
+      next: 'cart_and_checkout',
       userId,
       workflowContext: 'add_to_cart_with_deals',
       dealData,
@@ -151,20 +152,22 @@ async function supervisor(state: typeof SupervisorState.State) {
   // Normal routing logic for other requests
   const systemMessage = new SystemMessage(`You are a supervisor that routes customer requests to specialized agents in a grocery shopping system.
 
-You have three specialized agents available:
-1. **catalog_cart** - Handles product discovery, searching, browsing catalog, adding items to cart, viewing cart contents
-2. **payment_checkout** - Handles payment methods, checkout, purchase completion, order processing
-3. **deals** - Identifies product-specific deals and helps customers apply savings opportunities
+You have four specialized agents available:
+1. **catalog** - Handles product discovery, searching, browsing catalog, product information and recommendations
+2. **cart_and_checkout** - Handles cart management (add/remove items, view cart), checkout, and order completion
+3. **payment** - Handles only payment method management and setup
+4. **deals** - Identifies product-specific deals and helps customers apply savings opportunities
 
 Analyze the user's request and determine which agent should handle it. Respond with ONLY the agent name.
 
 Guidelines:
-- Use "catalog_cart" for: product searches, browsing, "show me", "find", "what's in my cart", product questions, inventory checks
+- Use "catalog" for: product searches, browsing, "show me products", "find items", product information, availability checks, recommendations
+- Use "cart_and_checkout" for: "add to cart", "what's in my cart", "remove from cart", "checkout", "buy", "purchase", "complete order"
 - Use "deals" for: checking deals, asking about discounts, when customers mention wanting to add items to cart (to check deals first)
-- Use "payment_checkout" for: "checkout", "buy", "purchase", "complete order", "pay", "payment method", "credit card"
-- If unclear, default to "catalog_cart" as it's the entry point for shopping
+- Use "payment" only for payment method management (adding cards, managing payment methods) - use cart_and_checkout for all checkout operations
+- If unclear, default to "catalog" for discovery requests or "cart_and_checkout" for action requests
 
-IMPORTANT: When customers want to add items to cart, the system should first check for deals via the deals agent, then proceed to catalog_cart.
+IMPORTANT: When customers want to add items to cart, the system should first check for deals via the deals agent, then proceed to cart_and_checkout.
 
 Current user message: "${lastMessage.content}"`);
 
@@ -172,8 +175,8 @@ Current user message: "${lastMessage.content}"`);
   const nextAgent = response.content.toString().trim().toLowerCase();
   
   // Validate the response
-  const validAgents = ['catalog_cart', 'payment_checkout', 'deals'];
-  const selectedAgent = validAgents.includes(nextAgent) ? nextAgent : 'catalog_cart';
+  const validAgents = ['catalog', 'cart_and_checkout', 'payment', 'deals'];
+  const selectedAgent = validAgents.includes(nextAgent) ? nextAgent : 'catalog';
   
   console.log(`[supervisor] Routing to agent: ${selectedAgent}`);
   
@@ -185,43 +188,74 @@ Current user message: "${lastMessage.content}"`);
 }
 
 // Agent functions that use the state
-async function catalogCartNode(state: typeof SupervisorState.State) {
-  const { messages, userId, workflowContext, dealData, pendingProduct } = state;
+async function catalogNode(state: typeof SupervisorState.State) {
+  const { messages, userId } = state;
   
-  console.log('[catalogCartNode] Processing with catalog/cart agent for user:', userId);
-  console.log('[catalogCartNode] Workflow context:', workflowContext);
-  console.log('[catalogCartNode] Deal data available:', !!dealData);
-  console.log('[catalogCartNode] Pending product:', pendingProduct);
+  console.log('[catalogNode] Processing with catalog agent for user:', userId);
+  
+  const agent = new CatalogAgent(userId || 'default-user');
+  
+  // Generate session ID for supervisor -> agent communication
+  const sessionId = `supervisor-catalog-${userId}-${Date.now()}`;
+  
+  // Use the agent's chat method for proper memory management
+  const lastMessage = messages[messages.length - 1];
+  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  const result = await agent.chat(messageContent, sessionId);
+  
+  return {
+    messages: result.messages,
+    next: END,
+  };
+}
+
+async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
+  const { messages, userId, workflowContext, dealData, pendingProduct, cartData } = state;
+  
+  console.log('[cartAndCheckoutNode] Processing with cart & checkout agent for user:', userId);
+  console.log('[cartAndCheckoutNode] Workflow context:', workflowContext);
+  console.log('[cartAndCheckoutNode] Deal data available:', !!dealData);
+  console.log('[cartAndCheckoutNode] Pending product:', pendingProduct);
+  console.log('[cartAndCheckoutNode] Cart data available:', !!cartData);
   
   // Special handling for prepare_checkout workflow
-  if (workflowContext === 'prepare_checkout') {
-    console.log('[catalogCartNode] Preparing cart data for checkout workflow');
+  if (workflowContext === 'prepare_checkout' && !cartData) {
+    console.log('[cartAndCheckoutNode] Preparing cart data for checkout workflow');
     
-    // Get cart data directly using the cart tool
-    const { getCartTool } = require('../tools/get-user-cart-langchain');
-    const cartTool = getCartTool(userId || 'default-user');
+    // Delegate cart preparation to the cart-and-checkout agent
+    const agent = new CartAndCheckoutAgent(userId || 'default-user');
+    
+    // Generate session ID for supervisor -> agent communication
+    const sessionId = `supervisor-cart-prep-${userId}-${Date.now()}`;
     
     try {
-      const cartResult = await cartTool.func({});
-      const cartData = JSON.parse(cartResult);
+      const result = await agent.chat('Please show me my current cart contents for checkout.', sessionId);
       
-      if (cartData.success && cartData.cart) {
-        console.log('[catalogCartNode] Cart data prepared successfully');
-        return {
-          messages: [new AIMessage('Cart prepared for checkout')],
-          cartData: cartData.cart,
-          workflowContext: 'prepare_checkout',
-          next: 'supervisor', // Return to supervisor with cart data
-        };
-      } else {
-        console.log('[catalogCartNode] Cart is empty or failed to retrieve');
+      // Parse the agent's response to extract cart data
+      const responseMessages = result.messages || [new AIMessage(result.content || 'No response')];
+      const lastResponse = responseMessages[responseMessages.length - 1];
+      const responseContent = typeof lastResponse.content === 'string' ? 
+        lastResponse.content : lastResponse.content.toString();
+      
+      // Check if cart has items based on agent response
+      if (responseContent.toLowerCase().includes('empty') || 
+          responseContent.toLowerCase().includes('no items')) {
+        console.log('[cartAndCheckoutNode] Cart is empty according to agent');
         return {
           messages: [new AIMessage('Cart is empty. Please add items before checkout.')],
           next: END,
         };
+      } else {
+        console.log('[cartAndCheckoutNode] Cart data prepared successfully via agent');
+        return {
+          messages: responseMessages,
+          cartData: { prepared: true, agentResponse: responseContent }, // Simplified cart data
+          workflowContext: 'prepare_checkout',
+          next: 'supervisor', // Return to supervisor with cart data
+        };
       }
     } catch (error) {
-      console.error('[catalogCartNode] Error preparing cart data:', error);
+      console.error('[cartAndCheckoutNode] Error preparing cart data via agent:', error);
       return {
         messages: [new AIMessage('Error retrieving cart data. Please try again.')],
         next: END,
@@ -231,53 +265,52 @@ async function catalogCartNode(state: typeof SupervisorState.State) {
   
   // Handle add-to-cart with deals workflow
   if (workflowContext === 'add_to_cart_with_deals' && pendingProduct) {
-    console.log('[catalogCartNode] Processing add-to-cart after deals check');
+    console.log('[cartAndCheckoutNode] Processing add-to-cart after deals check');
     
     // Create a message for adding the item to cart (deals already checked)
-    let cartMessage = new HumanMessage(
-      `Add ${pendingProduct.quantity || 1} ${pendingProduct.product} to cart${dealData ? ' (deals already checked)' : ''}`
-    );
+    const cartMessage = `Add ${pendingProduct.quantity || 1} ${pendingProduct.product} to cart${dealData ? ' (deals already checked)' : ''}`;
     
-    const agent = createCatalogCartAgent(userId || 'default-user');
+    const agent = new CartAndCheckoutAgent(userId || 'default-user');
     
-    const config = {
-      configurable: {
-        user_id: userId,
-        deal_context: dealData,
-        pending_product: pendingProduct
-      }
-    };
+    // Generate session ID for supervisor -> agent communication
+    const sessionId = `supervisor-cart-add-${userId}-${Date.now()}`;
     
-    const result = await agent.invoke({ messages: [cartMessage] }, config);
+    const result = await agent.chat(cartMessage, sessionId);
     
     return {
-      messages: result.messages,
+      messages: result.messages || [new AIMessage(result.content || 'Item added to cart')],
       next: END,
     };
   }
   
-  // Normal catalog/cart operations
-  const agent = createCatalogCartAgent(userId || 'default-user');
-  
-  // Pass proper configuration with user credentials
-  const { getUser } = require('../auth0');
-  let userObj = null;
-  try {
-    userObj = await getUser();
-  } catch (e) {
-    console.log('[catalogCartNode] Could not get user object, using userId only');
+  // Handle checkout processing with cart data
+  if (workflowContext === 'process_checkout' && cartData) {
+    console.log('[cartAndCheckoutNode] Processing checkout with prepared cart data');
+    
+    const agent = new CartAndCheckoutAgent(userId || 'default-user', cartData);
+    
+    // Generate session ID for supervisor -> agent communication
+    const sessionId = `supervisor-cart-checkout-${userId}-${Date.now()}`;
+    
+    const lastMessage = messages[messages.length - 1];
+    const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+    const result = await agent.chat(messageContent, sessionId);
+    
+    return {
+      messages: result.messages || [new AIMessage(result.content || 'Checkout processed')],
+      next: END,
+    };
   }
   
-  const config = {
-    configurable: {
-      user_id: userId,
-      _credentials: {
-        user: userObj || { sub: userId }
-      }
-    }
-  };
+  // Normal cart and checkout operations
+  const agent = new CartAndCheckoutAgent(userId || 'default-user', cartData);
   
-  const result = await agent.invoke({ messages }, config);
+  // Generate session ID for supervisor -> agent communication
+  const sessionId = `supervisor-cart-${userId}-${Date.now()}`;
+  
+  const lastMessage = messages[messages.length - 1];
+  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  const result = await agent.chat(messageContent, sessionId);
   
   return {
     messages: result.messages,
@@ -292,20 +325,23 @@ async function dealsNode(state: typeof SupervisorState.State) {
   console.log('[dealsNode] Workflow context:', workflowContext);
   console.log('[dealsNode] Pending product:', pendingProduct);
   
-  const agent = createDealsAgent(userId || 'default-user');
+  const agent = new DealsAgent(userId || 'default-user');
   
   // Create a message that includes the product information for deals checking
-  let dealsMessage = messages[messages.length - 1];
+  const lastMessage = messages[messages.length - 1];
+  let dealsMessage = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
   if (pendingProduct && workflowContext === 'check_deals') {
-    dealsMessage = new HumanMessage(
-      `Check for deals on ${pendingProduct.product}${pendingProduct.quantity ? ` (quantity: ${pendingProduct.quantity})` : ''}`
-    );
+    dealsMessage = `Check for deals on ${pendingProduct.product}${pendingProduct.quantity ? ` (quantity: ${pendingProduct.quantity})` : ''}`;
   }
   
-  const result = await agent.invoke({ messages: [dealsMessage] });
+  // Generate session ID for supervisor -> agent communication
+  const sessionId = `supervisor-deals-${userId}-${Date.now()}`;
+  
+  const result = await agent.chat(dealsMessage, sessionId);
   
   // Parse the result to determine if deals were found and confirmed
-  const lastResponse = result.messages[result.messages.length - 1];
+  const responseMessages = result.messages || [new AIMessage(result.content || 'No deals found')];
+  const lastResponse = responseMessages[responseMessages.length - 1];
   const responseContent = typeof lastResponse.content === 'string' ? 
     lastResponse.content : lastResponse.content.toString();
   
@@ -317,14 +353,14 @@ async function dealsNode(state: typeof SupervisorState.State) {
   if (isDealConfirmation) {
     // Deal found, waiting for user confirmation - stay in deals agent
     return {
-      messages: result.messages,
+      messages: responseMessages,
       workflowContext: 'awaiting_deal_confirmation',
       next: END,
     };
   } else {
     // No deals found or deal processed, move to catalog_cart
     return {
-      messages: result.messages,
+      messages: responseMessages,
       workflowContext: 'check_deals_complete',
       dealData: null, // Could extract deal info from response if needed
       next: 'supervisor',
@@ -332,37 +368,20 @@ async function dealsNode(state: typeof SupervisorState.State) {
   }
 }
 
-async function paymentCheckoutNode(state: typeof SupervisorState.State) {
+async function paymentNode(state: typeof SupervisorState.State) {
   const { messages, userId, cartData, workflowContext } = state;
   
-  console.log('[paymentCheckoutNode] Processing with payment/checkout agent for user:', userId);
-  console.log('[paymentCheckoutNode] Cart data available:', !!cartData);
-  console.log('[paymentCheckoutNode] Workflow context:', workflowContext);
+  console.log('[paymentNode] Processing with payment agent for user:', userId);
+  console.log('[paymentNode] Workflow context:', workflowContext);
   
-  // Pass proper configuration with user credentials for Auth0 CIBA
-  // We need to get the full user object for proper CIBA authorization
-  const { getUser } = require('../auth0');
-  let userObj = null;
-  try {
-    userObj = await getUser();
-  } catch (e) {
-    console.log('[paymentCheckoutNode] Could not get user object, using userId only');
-  }
+  const agent = new PaymentAgent(userId || 'default-user');
   
-  const config = {
-    configurable: {
-      user_id: userId,
-      _credentials: {
-        user: userObj || { sub: userId }
-      },
-      // Pass cart data through config for payment agent
-      cart_data: cartData,
-      workflow_context: workflowContext
-    }
-  };
+  // Generate session ID for supervisor -> agent communication
+  const sessionId = `supervisor-payment-${userId}-${Date.now()}`;
   
-  const agent = createPaymentCheckoutAgent(userId || 'default-user', cartData);
-  const result = await agent.invoke({ messages }, config);
+  const lastMessage = messages[messages.length - 1];
+  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  const result = await agent.chat(messageContent, sessionId);
   
   return {
     messages: result.messages,
@@ -373,16 +392,22 @@ async function paymentCheckoutNode(state: typeof SupervisorState.State) {
 // Build the graph
 const workflow = new StateGraph(SupervisorState)
   .addNode('supervisor', supervisor)
-  .addNode('catalog_cart', catalogCartNode)
-  .addNode('payment_checkout', paymentCheckoutNode)
+  .addNode('catalog', catalogNode)
+  .addNode('cart_and_checkout', cartAndCheckoutNode)
+  .addNode('payment', paymentNode)
   .addNode('deals', dealsNode)
   .addEdge(START, 'supervisor')
   .addConditionalEdges('supervisor', (state) => state.next, {
-    catalog_cart: 'catalog_cart',
-    payment_checkout: 'payment_checkout',
+    catalog: 'catalog',
+    cart_and_checkout: 'cart_and_checkout',
+    payment: 'payment',
     deals: 'deals',
   })
-  .addConditionalEdges('catalog_cart', (state) => state.next, {
+  .addConditionalEdges('catalog', (state) => state.next, {
+    supervisor: 'supervisor',
+    [END]: END,
+  })
+  .addConditionalEdges('cart_and_checkout', (state) => state.next, {
     supervisor: 'supervisor',
     [END]: END,
   })
@@ -390,20 +415,67 @@ const workflow = new StateGraph(SupervisorState)
     supervisor: 'supervisor',
     [END]: END,
   })
-  .addEdge('payment_checkout', END);
+  .addEdge('payment', END);
 
 export const supervisorGraph = workflow.compile();
 
-// For backward compatibility with existing API
+// Class-based Supervisor Agent to match the design pattern
+export class SupervisorAgent {
+  private userId: string;
+
+  constructor(userId: string) {
+    this.userId = userId;
+    console.log('[SupervisorAgent] Creating supervisor for userId:', userId);
+  }
+
+  // Standalone usage - can be called by any system
+  async chat(message: string, sessionId?: string): Promise<any> {
+    const threadId = sessionId || `supervisor-${this.userId}-default`;
+    
+    const result = await supervisorGraph.invoke({
+      messages: [new HumanMessage(message)],
+      userId: this.userId,
+      next: '',
+    });
+    
+    return result;
+  }
+
+  // Stream support for real-time responses
+  async stream(message: string, sessionId?: string) {
+    const threadId = sessionId || `supervisor-${this.userId}-default`;
+    
+    return supervisorGraph.stream({
+      messages: [new HumanMessage(message)],
+      userId: this.userId,
+      next: '',
+    });
+  }
+
+  // LangGraph-compatible invoke method
+  async invoke(input: { messages: any[] }, config?: any) {
+    return await supervisorGraph.invoke({
+      messages: input.messages,
+      userId: this.userId,
+      next: '',
+    });
+  }
+
+  // Get conversation history (supervisor manages state across multiple agents)
+  async getHistory(sessionId?: string) {
+    // Supervisor doesn't maintain its own memory, delegates to specialized agents
+    console.log(`[SupervisorAgent] History managed by individual specialized agents`);
+    return null;
+  }
+
+  // Clear session memory across all agents
+  async clearSession(sessionId?: string) {
+    console.log(`[SupervisorAgent] Session clearing delegated to individual agents`);
+    // In a full implementation, this could clear sessions across all agents
+  }
+}
+
+// Factory function for backward compatibility
 export const createSupervisorAgent = (userId: string) => {
-  return {
-    invoke: async (input: { messages: any[] }) => {
-      const result = await supervisorGraph.invoke({
-        messages: input.messages,
-        userId,
-        next: '',
-      });
-      return result;
-    }
-  };
+  return new SupervisorAgent(userId);
 };
