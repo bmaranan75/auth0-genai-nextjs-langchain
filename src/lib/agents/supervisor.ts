@@ -63,18 +63,35 @@ export function buildAgentContextMessage(
       // Include assistant messages only if produced by the target agent
       if (m.role === 'assistant' && m.agent === targetAgent) return true;
       return false;
-    })
-    .slice(-maxEntries); // take last N relevant entries
+    });
+
+  // Deduplicate by message content while preserving the most recent occurrence order
+  const seen = new Set<string>();
+  const deduped: AnnotatedMessage[] = [];
+  for (let i = filtered.length - 1; i >= 0; i--) {
+    const m = filtered[i];
+    const content = typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content);
+    if (!seen.has(content)) {
+      seen.add(content);
+      deduped.push(m);
+    }
+  }
+  deduped.reverse();
+
+  const recent = deduped.slice(-maxEntries); // take last N relevant entries
 
   // Compose lines with agent/source annotation to help the LLM quickly contextualize
-  const lines = filtered.map(m => {
+  const lines = recent.map(m => {
     const content = typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content);
     const src = m.role === 'assistant' ? (m.agent || 'assistant') : (m.role === 'system' ? 'system' : 'user');
     return `${src.toUpperCase()}: ${content}`;
   });
 
-  // Add the current user message at the end (most relevant)
-  lines.push(`USER_LATEST: ${currentUserMessage}`);
+  // Add the current user message at the end (most relevant) only if it's not already present
+  const alreadyPresent = lines.some(l => l.includes(currentUserMessage));
+  if (!alreadyPresent) {
+    lines.push(`USER_LATEST: ${currentUserMessage}`);
+  }
 
   // Keep the context compact
   return lines.join('\n\n');
