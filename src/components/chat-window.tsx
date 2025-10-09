@@ -68,6 +68,8 @@ export function ChatWindow(props: {
   const [isLoading, setIsLoading] = useState(false);
   const [conversationId, setConversationId] = useState<string>(() => generateConversationId());
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
 
   // Function to add ephemeral messages as part of chat
   const addEphemeralMessage = (type: NonNullable<LangChainMessage['ephemeralType']>, content: string) => {
@@ -79,6 +81,13 @@ export function ChatWindow(props: {
       ephemeralType: type,
     };
     setMessages(prev => [...prev, ephemeralMessage]);
+    
+    // Scroll to bottom after adding ephemeral message
+    setTimeout(() => {
+      if (messagesEndRef.current) {
+        messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      }
+    }, 50);
     
     // Auto-remove ephemeral messages after 10 seconds (except pending ones)
     if (type !== 'authorization-pending') {
@@ -97,6 +106,36 @@ export function ChatWindow(props: {
   const removePendingAuthMessages = () => {
     setMessages(prev => prev.filter(msg => !(msg.isEphemeral && msg.ephemeralType === 'authorization-pending')));
   };
+
+  // Function to remove completed authorization messages (but keep initial request message)
+  const removeCompletedAuthMessages = () => {
+    setMessages(prev => prev.filter(msg => !(msg.isEphemeral && ['authorization-pending', 'authorization-approved', 'authorization-denied'].includes(msg.ephemeralType || ''))));
+  };
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    const scrollToBottom = () => {
+      // Try multiple methods to ensure reliable scrolling
+      if (messagesEndRef.current) {
+        // Method 1: Scroll the target element into view
+        messagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }
+      
+      if (chatContainerRef.current) {
+        // Method 2: Directly scroll the container (fallback)
+        setTimeout(() => {
+          if (chatContainerRef.current) {
+            chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+          }
+        }, 50);
+      }
+    };
+    
+    // Use a small delay to ensure DOM has updated
+    const timeoutId = setTimeout(scrollToBottom, 100);
+    
+    return () => clearTimeout(timeoutId);
+  }, [messages]);
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -182,6 +221,13 @@ export function ChatWindow(props: {
     };
     
     setMessages(prev => [...prev, userMessage]);
+    
+    // Scroll to bottom after adding user message
+    setTimeout(() => {
+      if (messagesEndRef.current) {
+        messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      }
+    }, 50);
     
     // Check if this message likely requires authorization
     const needsAuth = requiresAuthorization(userMessage.content);
@@ -302,6 +348,19 @@ export function ChatWindow(props: {
       };
       
       setMessages(prev => [...prev, assistantMessage]);
+      
+      // Scroll to bottom after adding assistant response
+      setTimeout(() => {
+        if (messagesEndRef.current) {
+          messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        }
+      }, 150);
+      
+      // Clear completed authorization messages after successful response
+      // Give a short delay to let the user see the approved message before clearing
+      setTimeout(() => {
+        removeCompletedAuthMessages();
+      }, 3000);
 
     } catch (error) {
       console.error('Error:', error);
@@ -371,7 +430,7 @@ export function ChatWindow(props: {
         </Button>
       </div>
       
-      <div className="flex-1 overflow-auto p-4">
+      <div className="flex-1 overflow-auto p-4" id="chat-container" ref={chatContainerRef}>
         {messages.length === 0 ? (
           <div>{props.emptyStateComponent}</div>
         ) : (
@@ -433,6 +492,8 @@ export function ChatWindow(props: {
                 </div>
               );
             })}
+            {/* Invisible element for auto-scrolling */}
+            <div ref={messagesEndRef} />
           </div>
         )}
       </div>

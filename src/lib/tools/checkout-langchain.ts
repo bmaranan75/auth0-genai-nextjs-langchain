@@ -15,6 +15,13 @@ const setAuthorizationApproved = () => {
 export const getShopAuthState = () => authorizationState;
 export const resetShopAuthState = () => {
   authorizationState = null;
+  // Also notify main auth state to reset
+  try {
+    const { notifyShopAuthReset } = require('../auth0-ai-langchain');
+    notifyShopAuthReset();
+  } catch (e) {
+    // Ignore if not available
+  }
 };
 
 export const checkoutCartTool = tool(
@@ -68,12 +75,20 @@ export const checkoutCartTool = tool(
       } else {
         // Mock response for local testing
         const totalValue = cartData?.totalValue || 0;
+        
+        // Reset authorization state after successful mock checkout
+        resetShopAuthState();
+        
         return `Successfully processed checkout for cart totaling $${totalValue.toFixed(2)}. Order has been placed and will be processed for delivery.`;
       }
     }
 
     const result = await response.text();
     console.log(`[checkout-cart-tool] API response: ${result}`);
+    
+    // Reset authorization state after successful checkout
+    resetShopAuthState();
+    
     return result || `Successfully processed your cart checkout.`;
   },
   {
@@ -93,6 +108,9 @@ export const checkoutTool = tool(
 
     if (!apiUrl) {
       // No API set, mock a response
+      // Reset authorization state after successful mock checkout
+      resetShopAuthState();
+      
       return `Successfully ordered ${qty} ${product} for $${(qty * 3.99).toFixed(2)}`;
     }
 
@@ -139,6 +157,10 @@ export const checkoutTool = tool(
 
     const result = await response.text();
     console.log(`[checkout-tool] API response: ${result}`);
+    
+    // Reset authorization state after successful checkout
+    resetShopAuthState();
+    
     return result || `Successfully ordered ${qty} ${product}`;
   },
   {

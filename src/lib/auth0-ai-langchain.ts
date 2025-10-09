@@ -38,6 +38,11 @@ export const resetAuthorizationState = () => {
   }
 };
 
+// Function to be called when shop auth state changes to reset main auth state
+export const notifyShopAuthReset = () => {
+  authorizationState = { status: 'idle' };
+};
+
 // CIBA flow for user confirmation
 export const withAsyncAuthorization = auth0AI.withAsyncUserConfirmation({
   userID: async (params, config) => {

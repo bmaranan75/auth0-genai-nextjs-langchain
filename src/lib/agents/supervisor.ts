@@ -799,47 +799,12 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
   const lastMessage = messages[messages.length - 1];
   const originalContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
   
-  // Check if this is a checkout request - if so, get cart data first
+  // Check if this is a checkout request
   const isCheckoutRequest = originalContent.toLowerCase().includes('checkout') || 
                            originalContent.toLowerCase().includes('buy') ||
                            originalContent.toLowerCase().includes('purchase') ||
                            workflowContext === 'process_checkout' ||
                            workflowContext === 'prepare_checkout';
-  
-  if (isCheckoutRequest && !cartData) {
-    console.log('[cartAndCheckoutNode] Checkout request detected, but no cart data. Getting cart first...');
-    // First get the cart data before proceeding with checkout
-    try {
-      const baseUrl = process.env.NEXTJS_URL || 'http://localhost:3000';
-      const response = await fetch(`${baseUrl}/api/get-cart?userId=${encodeURIComponent(userId || 'default-user')}`);
-      
-      if (response.ok) {
-        const cartResponse = await response.json();
-        if (cartResponse.success && cartResponse.cart) {
-          console.log('[cartAndCheckoutNode] Retrieved cart data:', cartResponse.cart);
-          const updatedCartData = cartResponse.cart;
-          
-          // Now proceed with checkout message
-          messageToAgent = `User wants to checkout. Cart data: ${JSON.stringify(updatedCartData)}. ${originalContent}`;
-          
-          const result = await callLangGraphAgent('cart_and_checkout', messageToAgent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
-          
-          return {
-            messages: result.messages,
-            userId,
-            conversationId,
-            workflowContext: 'process_checkout',
-            dealData,
-            pendingProduct,
-            cartData: updatedCartData,
-            next: END,
-          };
-        }
-      }
-    } catch (error) {
-      console.error('[cartAndCheckoutNode] Error getting cart data:', error);
-    }
-  }
   
   if (workflowContext === 'add_to_cart_with_deals' && pendingProduct) {
     // Handle add-to-cart with deal context - provide full context to agent
@@ -857,10 +822,15 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     }
     
     console.log('[cartAndCheckoutNode] Deal context message:', messageToAgent);
-  } else if (cartData && isCheckoutRequest) {
-    // If we have cart data and this is a checkout request, include cart data in message
-    messageToAgent = `[userId:${userId}] User wants to checkout. Cart data: ${JSON.stringify(cartData)}. ${originalContent}`;
-    console.log('[cartAndCheckoutNode] Checkout message with cart data prepared');
+  } else if (isCheckoutRequest) {
+    // For checkout requests, let the agent handle getting cart data and processing checkout
+    if (cartData) {
+      messageToAgent = `[userId:${userId}] User wants to checkout. Cart data: ${JSON.stringify(cartData)}. ${originalContent}`;
+      console.log('[cartAndCheckoutNode] Checkout message with existing cart data prepared');
+    } else {
+      messageToAgent = `[userId:${userId}] User wants to checkout: "${originalContent}". Please get the current cart and process checkout.`;
+      console.log('[cartAndCheckoutNode] Checkout message without cart data - agent will handle getting cart');
+    }
   } else {
     // For other scenarios, use the original user message with userId context
     messageToAgent = `[userId:${userId}] ${originalContent}`;
