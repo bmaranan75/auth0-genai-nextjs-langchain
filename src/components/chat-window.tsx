@@ -3,10 +3,11 @@
 import { useState, useEffect, useRef } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { toast } from 'sonner';
-import { ArrowUpIcon, LoaderCircle } from 'lucide-react';
+import { ArrowUpIcon, LoaderCircle, MessageSquarePlus } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { cn } from '@/utils/cn';
+import { generateConversationId } from '@/utils/conversation-id';
 
 interface LangChainMessage {
   id: string;
@@ -65,6 +66,7 @@ export function ChatWindow(props: {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<LangChainMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [conversationId, setConversationId] = useState<string>(() => generateConversationId());
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Function to add ephemeral messages as part of chat
@@ -142,6 +144,23 @@ export function ChatWindow(props: {
     }, 2000); // Poll every 2 seconds
   };
 
+  // Function to start a new chat conversation
+  const startNewChat = () => {
+    const newConversationId = generateConversationId();
+    setConversationId(newConversationId);
+    setMessages([]);
+    setInput('');
+    
+    // Stop any ongoing polling
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    
+    console.log('[ChatWindow] Started new conversation:', newConversationId);
+    toast.success('New conversation started');
+  };
+
   // Function to check if message requires authorization
   const requiresAuthorization = (content: string): boolean => {
     const authKeywords = [
@@ -191,6 +210,7 @@ export function ChatWindow(props: {
               role: msg.role,
               content: msg.content,
             })),
+          conversationId, // Include conversation ID for agent context
         }),
       });
 
@@ -337,6 +357,20 @@ export function ChatWindow(props: {
 
   return (
     <div className="flex flex-col h-full">
+      {/* New Chat Button */}
+      <div className="flex justify-end p-4 pb-2 border-b border-gray-200 dark:border-gray-700">
+        <Button
+          onClick={startNewChat}
+          variant="outline"
+          size="sm"
+          className="flex items-center gap-2 text-sm"
+          disabled={isLoading}
+        >
+          <MessageSquarePlus className="h-4 w-4" />
+          New Chat
+        </Button>
+      </div>
+      
       <div className="flex-1 overflow-auto p-4">
         {messages.length === 0 ? (
           <div>{props.emptyStateComponent}</div>

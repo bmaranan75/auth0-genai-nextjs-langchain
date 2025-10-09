@@ -4,7 +4,8 @@
 import { createSupervisorAgent } from './agents/supervisor';
 
 // Export the createAgent function for backward compatibility
-export const createAgent = createSupervisorAgent;
+export const createAgent = (userId: string, conversationId?: string) => 
+  createSupervisorAgent(userId, conversationId);
 
 // Export the supervisor graph as the main graph for existing uses
 export { supervisorGraph as graph } from './agents/supervisor';

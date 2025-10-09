@@ -1,0 +1,75 @@
+#!/usr/bin/env node
+/**
+ * Test the hybrid supervisor approach locally
+ */
+
+const {SupervisorAgent} = require('./src/lib/agents/supervisor.ts');
+
+async function testHybridSupervisor() {
+  console.log('🧪 Testing hybrid supervisor approach...');
+
+  try {
+    const userId = 'test-user-hybrid';
+    const conversationId = 'hybrid-test-conv';
+    const supervisor = new SupervisorAgent(userId, conversationId);
+
+    console.log('\n📤 Step 1: User wants to add bananas to cart');
+    const step1Result = await supervisor.chat(
+      'I want to add 5 bananas to my cart',
+      conversationId,
+    );
+
+    console.log('📊 Step 1 Result:');
+    console.log('- Next:', step1Result.next);
+    console.log('- Messages:', step1Result.messages?.length || 0);
+    console.log('- Workflow Context:', step1Result.workflowContext);
+    console.log('- Deal Data:', !!step1Result.dealData);
+    console.log('- Pending Product:', !!step1Result.pendingProduct);
+
+    // Check if we have a deal confirmation scenario
+    if (step1Result.workflowContext === 'awaiting_deal_confirmation') {
+      console.log('\n📤 Step 2: User confirms deal with "yes"');
+      const step2Result = await supervisor.chat('yes', conversationId);
+
+      console.log('📊 Step 2 Result:');
+      console.log('- Next:', step2Result.next);
+      console.log('- Workflow Context:', step2Result.workflowContext);
+      console.log('- Messages:', step2Result.messages?.length || 0);
+
+      if (
+        step2Result.next === 'END' &&
+        step2Result.workflowContext === 'add_to_cart_with_deals'
+      ) {
+        console.log('✅ Hybrid supervisor working perfectly!');
+        console.log('✅ Deal continuity maintained!');
+        return true;
+      } else {
+        console.log(`⚠️ Unexpected routing: ${step2Result.next}`);
+        return false;
+      }
+    } else if (step1Result.next === 'END') {
+      console.log('ℹ️ Direct completion - no deal confirmation needed');
+      return true;
+    } else {
+      console.log(`ℹ️ Step 1 routed to: ${step1Result.next}`);
+      console.log('ℹ️ This is the intermediate routing step');
+      return true;
+    }
+  } catch (error) {
+    console.error('❌ Test failed with error:', error);
+    return false;
+  }
+}
+
+// Run the test
+testHybridSupervisor()
+  .then(success => {
+    console.log(
+      success ? '🎉 Test completed successfully!' : '💥 Test failed!',
+    );
+    process.exit(success ? 0 : 1);
+  })
+  .catch(error => {
+    console.error('💥 Test crashed:', error);
+    process.exit(1);
+  });

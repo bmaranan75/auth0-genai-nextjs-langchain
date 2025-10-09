@@ -1,26 +1,67 @@
-import { DynamicTool } from '@langchain/core/tools';
+import { DynamicStructuredTool } from '@langchain/core/tools';
+import { z } from 'zod';
 import { parseCartInput, formatToolResponse, logToolExecution } from './robust-tool-parser';
 
-export const addToCartTool = (userId: string) => new DynamicTool({
+// Circuit breaker to prevent infinite tool calls
+const addToCartCallCounter = new Map<string, number>();
+const MAX_ADD_TO_CART_CALLS = 2;
+
+export const addToCartTool = (defaultUserId: string = 'default-user') => new DynamicStructuredTool({
   name: 'add_to_cart',
   description: `
-    Add an item to the user's shopping cart. Use this tool when users ask to add products to their cart.
-    Input should be a JSON string with the following fields:
-    - productCode (required): The product code/id (e.g., "banana", "apple", "milk")
-    - quantity (optional): Number of items to add (default: 1)
-
-    Example inputs:
-    - '{"productCode": "banana", "quantity": 5}' - Add 5 bananas to cart
-    - '{"productCode": "apple", "quantity": 1}' - Add 1 apple to cart
-
-    This tool does not require step-up authorization, only basic login.
-    Use this tool immediately when users express intent to add items to their cart.
+    Add an item to the user's shopping cart. Extract the required information from the message and call this tool.
+    
+    WHEN TO USE: When you see messages like "Please add [quantity] [product] to cart" or "add [product] to cart"
+    
+    PARAMETER EXTRACTION: Extract these from the message:
+    - productCode: Product code from the message (e.g., "apple", "banana", "milk")  
+    - quantity: Number of items to add (extract from message, default: 1)
+    - userId: Extract from [userId:USER_ID] format in the message
+    
+    EXAMPLE MESSAGE: "[userId:user123] Please add 2 apples to cart using productCode 'apple'"
+    EXAMPLE TOOL CALL: {productCode: "apple", quantity: 2, userId: "user123"}
   `,
-  func: async (inputString) => {
+  schema: z.object({
+    productCode: z.string().describe('Product code to add to cart (e.g., "apple", "banana")'),
+    quantity: z.number().default(1).describe('Quantity to add (default: 1)'),
+    userId: z.string().describe('User ID extracted from message [userId:USER_ID] format')
+  }),
+  func: async (input: { productCode: string; quantity: number; userId: string }) => {
     const startTime = Date.now();
     
     try {
-      console.log(`[addToCartTool] Called with userId: ${userId}, input: ${inputString}`);
+      // 🔍 ENHANCED DEBUGGING - Log everything about the tool call
+      console.log('='.repeat(80));
+      console.log('[addToCartTool] 🔍 DETAILED TOOL CALL DEBUG');
+      console.log(`[addToCartTool] Raw input:`, inputString);
+      console.log(`[addToCartTool] Input type:`, typeof inputString);
+      console.log(`[addToCartTool] Input length:`, inputString?.length);
+      console.log(`[addToCartTool] Input JSON.stringify:`, JSON.stringify(inputString));
+      console.log(`[addToCartTool] Is undefined:`, inputString === undefined);
+      console.log(`[addToCartTool] Is null:`, inputString === null);
+      console.log(`[addToCartTool] Is empty string:`, inputString === '');
+      console.log('='.repeat(80));
+      
+      // CRITICAL: Prevent recursion when called with undefined/empty input
+      if (inputString === undefined || inputString === null || inputString === '') {
+        console.error(`[addToCartTool] 🚨 CRITICAL ERROR: Called with undefined/empty input!`);
+        console.error(`[addToCartTool] This indicates the LangGraph agent is not properly calling the tool.`);
+        console.error(`[addToCartTool] Expected format: {"productCode": "product_name", "quantity": 1, "userId": "user_id"}`);
+        
+        console.error(`[addToCartTool] DEBUGGING INFO:`);
+        console.error(`  - Input received: ${JSON.stringify(inputString)}`);
+        console.error(`  - Input type: ${typeof inputString}`);
+        console.error(`  - Agent should parse message and extract parameters`);
+        console.error(`  - Check if agent system prompt is clear about tool usage`);
+        
+        // Return a clear error that should stop the agent from retrying
+        return JSON.stringify({
+          success: false,
+          error: 'TOOL_CALL_ERROR: No product information provided. Cannot add undefined product to cart. Please specify productCode, quantity, and userId.',
+          action_required: 'Provide valid product information or ask user to clarify their request.',
+          debug_info: `Tool called with: ${JSON.stringify(inputString)} (type: ${typeof inputString})`
+        });
+      }
       
       // Use robust parser for input handling
       const parseResult = parseCartInput(inputString);
@@ -30,6 +71,41 @@ export const addToCartTool = (userId: string) => new DynamicTool({
       }
       
       let input = parseResult.data;
+      
+      // Extract userId from input or context message (check for [userId:USER_ID] format)
+      let userId = input.userId || defaultUserId;
+      
+      // Circuit breaker to prevent infinite calls
+      const sessionKey = `addToCart-${userId}`;
+      const currentCount = addToCartCallCounter.get(sessionKey) || 0;
+      
+      if (currentCount >= MAX_ADD_TO_CART_CALLS) {
+        console.error(`[addToCartTool] CIRCUIT BREAKER: Too many calls (${currentCount}) for user ${userId}. Preventing infinite loop.`);
+        return JSON.stringify({
+          success: false,
+          error: 'CIRCUIT_BREAKER: Too many add-to-cart attempts. This suggests a tool calling issue. Please refresh and try again.',
+          suggestion: 'Try rephrasing your request or contact support if the issue persists.'
+        });
+      }
+      
+      addToCartCallCounter.set(sessionKey, currentCount + 1);
+      
+      // Reset counter after 60 seconds
+      setTimeout(() => {
+        addToCartCallCounter.delete(sessionKey);
+      }, 60000);
+      
+      console.log(`[addToCartTool] Called with userId: ${userId}, input: ${inputString} (attempt ${currentCount + 1}/${MAX_ADD_TO_CART_CALLS})`);
+      console.log(`[addToCartTool] Input type: ${typeof inputString}, Input value:`, inputString);
+      
+      // CRITICAL: The issue is that LangGraph agents can't easily pass userId through tool parameters
+      // Since the tools are created with 'default-user', we need a different approach
+      // For now, let's handle the case where we have valid product info but wrong userId
+      if (userId === 'default-user' || userId === defaultUserId) {
+        console.warn(`[addToCartTool] WARNING: Using default userId. This suggests the LangGraph agent couldn't pass the real userId.`);
+        console.warn(`[addToCartTool] This is a known limitation with static LangGraph server tools.`);
+        // Continue with default-user for now, but log the issue
+      }
       
       // Handle empty input
       if (!input.productCode && !input.productName) {

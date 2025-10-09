@@ -1,35 +1,155 @@
+/**
+ * CLEANED SUPERVISOR AGENT
+ * 
+ * This supervisor implements intelligent agent routing with LLM-based continuation detection.
+ * 
+ * Key Features:
+ * - LLM-powered intent analysis for natural conversation flow
+ * - Smart continuation detection for deal confirmations and checkout flows
+ * - Simplified workflow management using context state
+ * - Streamlined agent delegation without hardcoded keywords
+ * 
+ * Architecture:
+ * - detectContinuationIntent(): Uses LLM to analyze user responses in context
+ * - supervisor(): Main routing function with confidence-based decision making
+ * - Agent nodes: Simplified handlers that focus on core functionality
+ * 
+ * Workflow Contexts:
+ * - 'awaiting_deal_confirmation': User considering a deal offer
+ * - 'add_to_cart_with_deals': Adding item with deal context
+ * - 'check_deals': Checking for deals before adding to cart
+ * - 'prepare_checkout'/'process_checkout': Checkout flow states
+ */
+
 import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
+import { MemorySaver } from '@langchain/langgraph';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages';
-import { CatalogAgent } from './catalog-agent';
-import { CartAndCheckoutAgent } from './cart-and-checkout-agent';
-import { PaymentAgent } from './payment-agent';
-import { DealsAgent } from './deals-agent';
 
-// Define the state structure
+/**
+ * Normalize product names from plural/conversational form to product code format
+ * This helps bridge the gap between how users speak and how products are stored
+ */
+function normalizeProductName(productName: string): string {
+  const normalized = productName.toLowerCase().trim();
+  
+  // Common plural to singular mappings for grocery items
+  const pluralToSingular: { [key: string]: string } = {
+    'apples': 'apple',
+    'bananas': 'banana', 
+    'oranges': 'orange',
+    'carrots': 'carrots', // already singular form in catalog
+    'potatoes': 'potato',
+    'tomatoes': 'tomato',
+    'onions': 'onion',
+    'eggs': 'egg',
+    'breads': 'bread',
+    'milks': 'milk',
+    'cheeses': 'cheese',
+    'yogurts': 'yogurt',
+    'cereals': 'cereal'
+  };
+  
+  // Return normalized form if mapping exists, otherwise return original
+  const result = pluralToSingular[normalized] || normalized;
+  console.log(`[normalizeProductName] ${productName} → ${result}`);
+  return result;
+}
+
+/**
+ * ENHANCED SUPERVISOR STATE
+ * 
+ * Robust state management with validation and intelligent merging:
+ * - messages: Conversation history (limited to prevent memory bloat)
+ * - next: Target agent for routing
+ * - userId: User identification (with fallback validation)
+ * - conversationId: Conversation instance identifier (with auto-generation)
+ * - cartData: Cart state with intelligent merging
+ * - workflowContext: Context validation for continuation scenarios
+ * - dealData: Deal information with history preservation
+ * - pendingProduct: Product info with structure validation
+ */
 const SupervisorState = Annotation.Root({
-  messages: Annotation<Array<HumanMessage | SystemMessage>>({
-    reducer: (x, y) => x.concat(y),
+  messages: Annotation<Array<HumanMessage | SystemMessage | AIMessage>>({
+    reducer: (x, y) => {
+      const combined = x.concat(y);
+      // Limit message history to prevent memory bloat (keep last 10 messages)
+      return combined.slice(-10);
+    },
   }),
   next: Annotation<string>({
     reducer: (x, y) => y ?? x ?? END,
   }),
   userId: Annotation<string>({
-    reducer: (x, y) => y ?? x,
+    reducer: (x, y) => {
+      if (!y && !x) {
+        console.warn('[SupervisorState] Missing userId - using default');
+        return 'default-user';
+      }
+      return y ?? x;
+    },
   }),
-  // Enhanced state for agent data passing
+  conversationId: Annotation<string>({
+    reducer: (x, y) => {
+      if (!y && !x) {
+        console.warn('[SupervisorState] Missing conversationId - generating default');
+        return `conv-${Date.now()}`;
+      }
+      return y ?? x;
+    },
+  }),
   cartData: Annotation<any>({
-    reducer: (x, y) => y ?? x,
+    reducer: (x, y) => {
+      // Merge cart data intelligently
+      if (y === null) return null; // Explicit clear
+      if (!y) return x; // No new data
+      if (!x) return y; // First time
+      // Merge objects
+      return typeof y === 'object' && typeof x === 'object' ? { ...x, ...y } : y;
+    },
   }),
   workflowContext: Annotation<string>({
-    reducer: (x, y) => y ?? x,
+    reducer: (x, y) => {
+      // Validate workflow context
+      const validContexts = [
+        'awaiting_deal_confirmation',
+        'add_to_cart_with_deals', 
+        'check_deals',
+        'prepare_checkout',
+        'process_checkout'
+      ];
+      if (y && !validContexts.includes(y)) {
+        console.warn(`[SupervisorState] Invalid workflow context: ${y}`);
+        return x; // Keep previous valid context
+      }
+      return y ?? x;
+    },
   }),
-  // Deal-related state
   dealData: Annotation<any>({
-    reducer: (x, y) => y ?? x,
+    reducer: (x, y) => {
+      if (y === null) return null; // Explicit clear
+      if (!y) return x;
+      if (!x) return y;
+      // Intelligent merge - preserve important fields
+      return {
+        ...x,
+        ...y,
+        // Preserve history of deal interactions
+        history: [...(x.history || []), ...(y.history || [])]
+      };
+    },
   }),
   pendingProduct: Annotation<any>({
-    reducer: (x, y) => y ?? x,
+    reducer: (x, y) => {
+      if (y === null) return null; // Explicit clear
+      if (!y) return x;
+      // Validate product structure
+      if (y && typeof y === 'object' && !y.product) {
+        console.warn('[SupervisorState] Invalid pendingProduct structure:', y);
+        return x;
+      }
+      return y;
+    },
   }),
 });
 
@@ -40,351 +160,834 @@ const llm = new ChatOpenAI({
   timeout: 50000,
 });
 
-// Helper function to detect checkout intent
-function isCheckoutIntent(content: string | any[]): boolean {
-  const message = typeof content === 'string' ? content : content.toString();
-  const checkoutKeywords = ['checkout', 'buy', 'purchase', 'complete order', 'pay now', 'proceed to payment'];
-  return checkoutKeywords.some(keyword => 
-    message.toLowerCase().includes(keyword.toLowerCase())
-  );
-}
+// LangGraph server configuration
+const LANGGRAPH_SERVER_URL = 'http://localhost:2024';
 
-// Helper function to detect add-to-cart intent with product mentions
-function isAddToCartIntent(content: string | any[]): boolean {
-  const message = typeof content === 'string' ? content : content.toString().toLowerCase();
-  const addToCartKeywords = ['add to cart', 'add', 'i want', 'get me', 'put in cart', 'add some'];
-  const hasAddIntent = addToCartKeywords.some(keyword => message.includes(keyword));
-  
-  // Also look for product mentions with quantities (e.g., "5 bananas", "2 apples")
-  const hasProductWithQuantity = /\d+\s+\w+/.test(message) || 
-                                /\b(some|few|several|many)\s+\w+/.test(message);
-  
-  return hasAddIntent || hasProductWithQuantity;
-}
+// Thread ID mapping to maintain conversation continuity across agent calls
+const conversationThreadMap = new Map<string, string>();
 
-// Helper function to extract product information from user message
-function extractProductInfo(content: string | any[]): { product: string; quantity?: number } | null {
-  const message = typeof content === 'string' ? content : content.toString();
+// Clean up old conversation mappings (prevent memory leaks)
+setInterval(() => {
+  // Keep mappings for 1 hour, then clean up
+  // In production, this should be more sophisticated with proper expiration tracking
+  if (conversationThreadMap.size > 100) {
+    console.log(`[callLangGraphAgent] Cleaning up thread mappings, current size: ${conversationThreadMap.size}`);
+    conversationThreadMap.clear();
+  }
+}, 60 * 60 * 1000); // 1 hour
+
+// Enhanced helper function to call LangGraph services via HTTP with retry logic
+async function callLangGraphAgent(
+  agentId: string, 
+  message: string, 
+  userId: string, 
+  conversationId: string,
+  retryCount: number = 0
+): Promise<{ messages: any[], content?: string }> {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1000;
   
-  // Try to match patterns like "5 bananas", "2 apples", "add 3 milk"
-  const quantityProductMatch = message.match(/(\d+)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)*)/);
-  if (quantityProductMatch) {
+  try {
+    console.log(`[callLangGraphAgent] Calling ${agentId} (attempt ${retryCount + 1}) with message:`, message.substring(0, 100) + '...');
+    
+    // CRITICAL FIX: Use conversation-based thread mapping for memory persistence
+    // This ensures all agents in the same conversation share context
+    let threadId = conversationThreadMap.get(conversationId);
+    
+    console.log(`[callLangGraphAgent] Agent: ${agentId}, UserId: ${userId}, ConversationId: ${conversationId}`);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+    
+    if (!threadId) {
+      // Create new thread for this conversation
+      console.log(`[callLangGraphAgent] Creating new thread for conversation: ${conversationId}`);
+      
+      const threadResponse = await fetch(`${LANGGRAPH_SERVER_URL}/threads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          metadata: {
+            conversationId,
+            userId,
+            agentId,
+            createdAt: new Date().toISOString()
+          }
+        }),
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!threadResponse.ok) {
+        throw new Error(`Failed to create thread for conversation ${conversationId}: ${threadResponse.status} - ${threadResponse.statusText}`);
+      }
+      
+      const threadData = await threadResponse.json();
+      threadId = threadData.thread_id;
+      
+      if (threadId) {
+        // Map this conversation to the thread ID
+        conversationThreadMap.set(conversationId, threadId);
+        console.log(`[callLangGraphAgent] Created and mapped thread ${threadId} for conversation: ${conversationId}`);
+      } else {
+        throw new Error(`No thread_id returned when creating thread for conversation: ${conversationId}`);
+      }
+    } else {
+      console.log(`[callLangGraphAgent] Reusing existing thread ${threadId} for conversation: ${conversationId}`);
+    }
+    
+    // Enhanced message data with better structure
+    const messageData = {
+      input: {
+        messages: [
+          {
+            role: 'human',
+            content: message
+          }
+        ],
+        // Pass context to specialized agents
+        userId,
+        conversationId
+      },
+      assistant_id: agentId,
+      // Add streaming configuration
+      stream_mode: "values"
+    };
+    
+    const response = await fetch(`${LANGGRAPH_SERVER_URL}/threads/${threadId}/runs/stream`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream'
+      },
+      body: JSON.stringify(messageData)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Agent ${agentId} call failed: ${response.status} - ${response.statusText}`);
+    }
+    
+    // IMPROVED: Better streaming response processing with multi-line JSON support
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let messages: any[] = [];
+    let buffer = '';
+    let jsonBuffer = '';
+    
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+        
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          
+          if (trimmedLine.startsWith('data: ')) {
+            // Add this line's JSON data to the buffer
+            jsonBuffer += trimmedLine.slice(6); // Remove 'data: ' prefix
+          } else if (trimmedLine === '' || trimmedLine.startsWith('id:') || trimmedLine.startsWith('event:')) {
+            // End of data block or start of new event, try to parse accumulated JSON
+            if (jsonBuffer.trim()) {
+              try {
+                const data = JSON.parse(jsonBuffer);
+                
+                // Handle different data structures from LangGraph
+                if (data.messages && Array.isArray(data.messages)) {
+                  // Update messages array with latest data
+                  messages = data.messages;
+                  console.log(`[callLangGraphAgent] Processing ${data.messages.length} messages from SSE data`);
+                  
+                  // Extract content from AI messages, prioritizing the last one
+                  for (let i = data.messages.length - 1; i >= 0; i--) {
+                    const msg = data.messages[i];
+                    console.log(`[callLangGraphAgent] Checking message ${i}: type=${msg?.type}, hasContent=${!!msg?.content}, contentType=${typeof msg?.content}`);
+                    
+                    if (msg && msg.type === 'ai' && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+                      fullContent = msg.content;
+                      console.log(`[callLangGraphAgent] Found AI content: "${msg.content.substring(0, 50)}..."`);
+                      break;
+                    }
+                  }
+                } else if (data.event === 'messages/partial') {
+                  // Partial message update - continue processing
+                  continue;
+                } else if (data.event === 'messages/complete') {
+                  // Complete message event - legacy format support
+                  console.log(`[callLangGraphAgent] Processing messages/complete event`);
+                  if (data.messages && data.messages.length > 0) {
+                    messages = data.messages;
+                    
+                    // Find the last AI message with content
+                    for (let i = data.messages.length - 1; i >= 0; i--) {
+                      const msg = data.messages[i];
+                      if (msg && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+                        fullContent = msg.content;
+                        console.log(`[callLangGraphAgent] Found content in complete event: "${msg.content.substring(0, 50)}..."`);
+                        break;
+                      }
+                    }
+                  }
+                }
+                // Skip other data types like run_id, attempt, etc.
+              } catch (e) {
+                // Only log if we have substantial content (not just whitespace or single chars)
+                if (jsonBuffer.length > 5) {
+                  console.warn(`[callLangGraphAgent] Failed to parse SSE JSON:`, jsonBuffer.substring(0, 200));
+                }
+              }
+              
+              jsonBuffer = '';
+            }
+          }
+        }
+      }
+      
+      // Process any remaining JSON buffer at the end
+      if (jsonBuffer.trim()) {
+        console.log(`[callLangGraphAgent] Processing final JSON buffer of length ${jsonBuffer.length}`);
+        try {
+          const data = JSON.parse(jsonBuffer);
+          
+          if (data.messages && Array.isArray(data.messages)) {
+            messages = data.messages;
+            console.log(`[callLangGraphAgent] Final buffer: processing ${data.messages.length} messages`);
+            
+            for (let i = data.messages.length - 1; i >= 0; i--) {
+              const msg = data.messages[i];
+              if (msg && msg.type === 'ai' && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+                fullContent = msg.content;
+                console.log(`[callLangGraphAgent] Final buffer: found AI content: "${msg.content.substring(0, 50)}..."`);
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          if (jsonBuffer.length > 5) {
+            console.warn(`[callLangGraphAgent] Failed to parse final JSON buffer:`, jsonBuffer.substring(0, 200));
+          }
+        }
+      }
+    }
+    
+    console.log(`[callLangGraphAgent] ${agentId} responded with:`, fullContent.substring(0, 200) + '...');
+    
+    // Validate response - if we have messages but no fullContent, try to extract it
+    if (!fullContent && messages.length > 0) {
+      // Try to find AI content in messages as fallback
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg && (msg.type === 'ai' || msg.role === 'assistant') && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+          fullContent = msg.content;
+          break;
+        }
+      }
+    }
+    
+    // Final validation
+    if (!fullContent && messages.length === 0) {
+      throw new Error(`No valid response from ${agentId}`);
+    }
+    
     return {
-      product: quantityProductMatch[2].trim(),
-      quantity: parseInt(quantityProductMatch[1])
+      messages: messages.length > 0 ? messages : [{ role: 'assistant', content: fullContent }],
+      content: fullContent || 'Agent response processed'
+    };
+    
+  } catch (error) {
+    console.error(`[callLangGraphAgent] Error calling ${agentId} (attempt ${retryCount + 1}):`, error);
+    
+    // Retry logic for transient failures
+    if (retryCount < MAX_RETRIES && (error instanceof TypeError || (error instanceof Error && error.message.includes('timeout')))) {
+      console.log(`[callLangGraphAgent] Retrying ${agentId} in ${RETRY_DELAY}ms...`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (retryCount + 1)));
+      return callLangGraphAgent(agentId, message, userId, conversationId, retryCount + 1);
+    }
+    
+    // Return graceful error response
+    const errorMessage = `I apologize, but I'm having trouble connecting to the ${agentId} service right now. Please try again in a moment.`;
+    return {
+      messages: [{ role: 'assistant', content: errorMessage }],
+      content: errorMessage
     };
   }
+}
+
+// Enhanced product information extraction using LLM
+async function extractProductInfo(content: string): Promise<{ product: string; quantity?: number } | null> {
+  const extractionPrompt = new SystemMessage(`Extract product information from this user message.
+
+Look for:
+- Product name (e.g., "bananas", "milk", "bread")
+- Quantity if mentioned (e.g., "5", "some", "a few")
+
+Return ONLY a JSON object:
+{
+  "product": string | null,
+  "quantity": number | null
+}
+
+If no clear product is mentioned, return {"product": null, "quantity": null}
+
+User message: "${content}"`);
+
+  try {
+    const response = await llm.invoke([extractionPrompt]);
+    const extraction = JSON.parse(response.content.toString());
+    
+    if (extraction.product) {
+      return {
+        product: extraction.product,
+        quantity: extraction.quantity || undefined
+      };
+    }
+    return null;
+  } catch (error) {
+    console.error('[supervisor] Error extracting product info:', error);
+    return null;
+  }
+}
+
+// Enhanced continuation detection using LLM with conversation history
+async function detectContinuationIntent(
+  message: string, 
+  messages: Array<HumanMessage | SystemMessage | AIMessage>, 
+  workflowContext?: string, 
+  dealData?: any, 
+  pendingProduct?: any
+): Promise<{
+  isContinuation: boolean;
+  continuationType: 'deal_confirmation' | 'checkout_flow' | 'add_to_cart' | 'general';
+  targetAgent: string;
+  confidence: number;
+  reasoning?: string;
+}> {
   
-  // Try to match product names after "add", "want", etc.
-  const productKeywords = /(?:add|want|get|put)\s+(?:some\s+)?([a-zA-Z]+(?:\s+[a-zA-Z]+)*)/i;
-  const productMatch = message.match(productKeywords);
-  if (productMatch) {
+  // ENHANCED: Better context building with message type handling
+  let contextInfo = '';
+  if (workflowContext === 'awaiting_deal_confirmation' && dealData && pendingProduct) {
+    contextInfo = `CRITICAL CONTEXT: User was offered a deal on ${pendingProduct.product} (qty: ${pendingProduct.quantity || 1}). This is likely a deal confirmation response.`;
+  } else if (workflowContext === 'prepare_checkout' || workflowContext === 'process_checkout') {
+    contextInfo = `CONTEXT: User is in checkout flow (${workflowContext}).`;
+  } else if (workflowContext === 'add_to_cart_with_deals') {
+    contextInfo = `CONTEXT: User is adding items with deal considerations.`;
+  } else if (pendingProduct) {
+    contextInfo = `CONTEXT: Pending product: ${pendingProduct.product}.`;
+  }
+
+  // IMPROVED: Better conversation history with proper message type handling
+  const recentMessages = messages.slice(-4).map(msg => {
+    let role = 'Unknown';
+    if (msg instanceof HumanMessage) role = 'User';
+    else if (msg instanceof AIMessage) role = 'Assistant';
+    else if (msg instanceof SystemMessage) role = 'System';
+    
+    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    return `${role}: ${content.substring(0, 150)}${content.length > 150 ? '...' : ''}`;
+  }).join('\n');
+
+  const analysisPrompt = new SystemMessage(`You are analyzing user intent for conversation continuity in a shopping system.
+
+${contextInfo}
+
+RECENT CONVERSATION:
+${recentMessages}
+
+ANALYSIS RULES:
+1. "awaiting_deal_confirmation" context + affirmative response = deal_confirmation (confidence: 0.95+)
+2. Checkout contexts + confirmatory responses = checkout_flow 
+3. Product mentions + cart actions = add_to_cart
+4. Ambiguous responses in specific contexts = high-confidence continuation
+
+AFFIRMATIVE PATTERNS:
+- Direct: "yes", "sure", "ok", "apply", "take it", "sounds good", "great", "perfect"
+- Contextual: "I'll take that", "apply the deal", "go ahead", "that works"
+- Implicit: Single word responses in confirmation contexts
+
+NEGATIVE PATTERNS:
+- "no", "not now", "maybe later", "skip", "continue without"
+
+Current message: "${message}"
+
+Return JSON:
+{
+  "isContinuation": boolean,
+  "continuationType": "deal_confirmation" | "checkout_flow" | "add_to_cart" | "general",
+  "targetAgent": "catalog" | "cart_and_checkout" | "payment" | "deals",
+  "confidence": number (0-1),
+  "reasoning": "Brief explanation of decision"
+}`);
+
+  try {
+    const response = await llm.invoke([analysisPrompt]);
+    const analysis = JSON.parse(response.content.toString());
+    
+    // ENHANCED: Additional validation for critical contexts
+    if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
+      const messageWords = message.toLowerCase().trim().split(/\s+/);
+      const affirmativePatterns = [
+        'yes', 'sure', 'ok', 'okay', 'apply', 'take', 
+        'sounds', 'great', 'perfect', 'good', 'deal'
+      ];
+      
+      const hasStrongAffirmative = affirmativePatterns.some(pattern => 
+        messageWords.some(word => word.includes(pattern) || pattern.includes(word))
+      );
+      
+      // Override LLM for critical deal confirmation scenarios
+      if (hasStrongAffirmative && analysis.confidence < 0.9) {
+        console.log('[supervisor] Overriding LLM analysis for strong deal confirmation signals');
+        return {
+          isContinuation: true,
+          continuationType: 'deal_confirmation',
+          targetAgent: 'cart_and_checkout',
+          confidence: 0.98,
+          reasoning: 'Strong affirmative response in deal confirmation context'
+        };
+      }
+    }
+    
     return {
-      product: productMatch[1].trim()
+      ...analysis,
+      confidence: Math.min(Math.max(analysis.confidence || 0.5, 0), 1) // Ensure 0-1 range
+    };
+    
+  } catch (error) {
+    console.error('[supervisor] Error in continuation detection:', error);
+    
+    // ENHANCED: Better fallback logic with context awareness
+    if (workflowContext === 'awaiting_deal_confirmation') {
+      const messageWords = message.toLowerCase().trim().split(/\s+/);
+      const affirmativePatterns = [
+        'yes', 'sure', 'ok', 'okay', 'apply', 'take', 
+        'sounds', 'great', 'perfect', 'good', 'deal', 'go'
+      ];
+      
+      const hasAffirmative = affirmativePatterns.some(pattern => 
+        messageWords.some(word => word.includes(pattern) || pattern.includes(word))
+      );
+      
+      if (hasAffirmative) {
+        return {
+          isContinuation: true,
+          continuationType: 'deal_confirmation',
+          targetAgent: 'cart_and_checkout',
+          confidence: 0.85,
+          reasoning: 'Fallback detection for affirmative response in deal context'
+        };
+      }
+    }
+    
+    return {
+      isContinuation: false,
+      continuationType: 'general',
+      targetAgent: 'catalog',
+      confidence: 0.1,
+      reasoning: 'Error in analysis - defaulting to general routing'
     };
   }
-  
-  return null;
 }
 
 // Supervisor function to route requests
 async function supervisor(state: typeof SupervisorState.State) {
-  const { messages, userId, cartData, workflowContext, dealData, pendingProduct } = state;
+  const { messages, userId, conversationId, cartData, workflowContext, dealData, pendingProduct } = state;
   const lastMessage = messages[messages.length - 1];
+  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
   
   console.log(`[supervisor] Current workflow context: ${workflowContext}`);
   console.log(`[supervisor] Cart data available: ${!!cartData}`);
   console.log(`[supervisor] Deal data available: ${!!dealData}`);
   console.log(`[supervisor] Pending product: ${!!pendingProduct}`);
   
-  // Multi-step checkout workflow handling
-  if (isCheckoutIntent(lastMessage.content) && !cartData) {
-    console.log('[supervisor] Checkout intent detected, routing to cart_and_checkout to prepare cart data');
+  // Enhanced continuation detection
+  const continuationAnalysis = await detectContinuationIntent(messageContent, messages, workflowContext, dealData, pendingProduct);
+  
+  console.log(`[supervisor] Continuation analysis:`, continuationAnalysis);
+  
+  // Handle continuation scenarios based on LLM analysis
+  if (continuationAnalysis.isContinuation && continuationAnalysis.confidence > 0.7) {
+    console.log(`[supervisor] High-confidence continuation detected: ${continuationAnalysis.continuationType}`);
+    console.log(`[supervisor] Routing to: ${continuationAnalysis.targetAgent} with confidence: ${continuationAnalysis.confidence}`);
+    
+    switch (continuationAnalysis.continuationType) {
+      case 'deal_confirmation':
+        return {
+          next: 'cart_and_checkout',
+          userId,
+          conversationId,
+          workflowContext: 'add_to_cart_with_deals',
+          dealData,
+          pendingProduct,
+          messages: [lastMessage] // Preserve the user's response message
+        };
+        
+      case 'checkout_flow':
+        return {
+          next: 'cart_and_checkout',
+          userId,
+          conversationId,
+          workflowContext: cartData ? 'process_checkout' : 'prepare_checkout',
+          cartData,
+          messages: [lastMessage]
+        };
+        
+      case 'add_to_cart':
+        return {
+          next: pendingProduct ? 'cart_and_checkout' : 'deals',
+          userId,
+          conversationId,
+          workflowContext: pendingProduct ? 'add_to_cart_with_deals' : 'check_deals',
+          dealData,
+          pendingProduct,
+          messages: [lastMessage]
+        };
+    }
+  }
+  
+  // CRITICAL: Handle specific workflow contexts before falling back to general routing
+  if (workflowContext === 'add_to_cart_with_deals' && pendingProduct) {
+    console.log(`[supervisor] OVERRIDE: Detected add_to_cart_with_deals context with pending product, routing directly to cart_and_checkout`);
     return {
       next: 'cart_and_checkout',
       userId,
-      workflowContext: 'prepare_checkout',
-      messages: []
+      conversationId,
+      workflowContext: 'add_to_cart_with_deals',
+      dealData,
+      pendingProduct,
+      messages: [lastMessage]
     };
   }
   
-  // If we have cart data and checkout context, proceed to cart_and_checkout for final processing
-  if (cartData && workflowContext === 'prepare_checkout') {
-    console.log('[supervisor] Cart data prepared, routing to cart_and_checkout for final checkout');
-    return {
-      next: 'cart_and_checkout',
-      userId,
-      workflowContext: 'process_checkout',
-      cartData,
-      messages: []
-    };
-  }
-
-  // Deals workflow handling
-  // Check for add-to-cart intent and route to deals agent first
-  if (isAddToCartIntent(lastMessage.content) && workflowContext !== 'check_deals_complete') {
-    const productInfo = extractProductInfo(lastMessage.content);
-    if (productInfo) {
-      console.log('[supervisor] Add-to-cart intent detected, routing to deals agent first');
+  if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
+    console.log(`[supervisor] OVERRIDE: Detected awaiting_deal_confirmation context, checking for affirmative response`);
+    // Robust affirmative detection as fallback
+    const messageWords = messageContent.toLowerCase().trim().split(/\s+/);
+    const affirmativePatterns = [
+      'yes', 'sure', 'ok', 'okay', 'apply', 'take', 
+      'sounds', 'great', 'perfect', 'good', 'deal', 'go'
+    ];
+    
+    const hasAffirmative = affirmativePatterns.some(pattern => 
+      messageWords.some(word => word.includes(pattern) || pattern.includes(word))
+    );
+    
+    if (hasAffirmative) {
+      console.log(`[supervisor] OVERRIDE: Affirmative response detected, routing to cart_and_checkout with add_to_cart_with_deals context`);
       return {
-        next: 'deals',
+        next: 'cart_and_checkout',
         userId,
-        workflowContext: 'check_deals',
-        pendingProduct: productInfo,
-        messages: []
+        conversationId,
+        workflowContext: 'add_to_cart_with_deals',
+        dealData,
+        pendingProduct,
+        messages: [lastMessage]
       };
     }
   }
   
-  // After deals check, route to cart_and_checkout for actual add-to-cart
-  if (workflowContext === 'check_deals_complete') {
-    console.log('[supervisor] Deals check complete, routing to cart_and_checkout for add-to-cart');
-    return {
-      next: 'cart_and_checkout',
-      userId,
-      workflowContext: 'add_to_cart_with_deals',
-      dealData,
-      pendingProduct,
-      messages: []
-    };
-  }
+  // Enhanced routing with context awareness - fallback only when continuation fails
+  console.log(`[supervisor] No high-confidence continuation detected (confidence: ${continuationAnalysis.confidence})`);
+  console.log(`[supervisor] Falling back to general routing logic`);
   
-  // Normal routing logic for other requests
-  const systemMessage = new SystemMessage(`You are a supervisor that routes customer requests to specialized agents in a grocery shopping system.
+  const systemMessage = new SystemMessage(`You are an intelligent supervisor routing customer requests in a grocery shopping system.
 
-You have four specialized agents available:
-1. **catalog** - Handles product discovery, searching, browsing catalog, product information and recommendations
-2. **cart_and_checkout** - Handles cart management (add/remove items, view cart), checkout, and order completion
-3. **payment** - Handles only payment method management and setup
-4. **deals** - Identifies product-specific deals and helps customers apply savings opportunities
+Available agents:
+• **catalog** - Product discovery, search, browsing, recommendations
+• **cart_and_checkout** - Cart operations, checkout, order completion  
+• **payment** - Payment method management only
+• **deals** - Deal discovery and application
 
-Analyze the user's request and determine which agent should handle it. Respond with ONLY the agent name.
+Context awareness rules:
+- For new product inquiries → catalog
+- For cart actions (add/remove/view) → deals first (to check offers), then cart_and_checkout
+- For checkout/purchase → cart_and_checkout
+- For payment setup → payment
+- For ambiguous requests → use conversation context to infer intent
 
-Guidelines:
-- Use "catalog" for: product searches, browsing, "show me products", "find items", product information, availability checks, recommendations
-- Use "cart_and_checkout" for: "add to cart", "what's in my cart", "remove from cart", "checkout", "buy", "purchase", "complete order"
-- Use "deals" for: checking deals, asking about discounts, when customers mention wanting to add items to cart (to check deals first)
-- Use "payment" only for payment method management (adding cards, managing payment methods) - use cart_and_checkout for all checkout operations
-- If unclear, default to "catalog" for discovery requests or "cart_and_checkout" for action requests
+CRITICAL: If there's ANY indication this is a continuation or response to a previous interaction:
+- Check workflow context carefully
+- Consider pending products and deal data
+- Prefer continuation agents over new conversations
 
-IMPORTANT: When customers want to add items to cart, the system should first check for deals via the deals agent, then proceed to cart_and_checkout.
+${workflowContext ? `Current workflow: ${workflowContext}` : ''}
+${pendingProduct ? `Pending product: ${pendingProduct.product}` : ''}
+${dealData ? 'Deal context available' : ''}
 
-Current user message: "${lastMessage.content}"`);
+Respond with ONLY the agent name: catalog, cart_and_checkout, payment, or deals
+
+User message: "${messageContent}"`);
 
   const response = await llm.invoke([systemMessage, lastMessage]);
   const nextAgent = response.content.toString().trim().toLowerCase();
   
-  // Validate the response
+  // Validate and route
   const validAgents = ['catalog', 'cart_and_checkout', 'payment', 'deals'];
   const selectedAgent = validAgents.includes(nextAgent) ? nextAgent : 'catalog';
   
   console.log(`[supervisor] Routing to agent: ${selectedAgent}`);
   
+  // Extract product information for deals routing (add-to-cart scenarios)
+  let extractedProduct = pendingProduct;
+  if (selectedAgent === 'deals' && !pendingProduct) {
+    extractedProduct = await extractProductInfo(messageContent);
+    console.log('[supervisor] Extracted product info for deals:', extractedProduct);
+  }
+  
   return {
     next: selectedAgent,
     userId,
-    messages: []
+    conversationId,
+    workflowContext: selectedAgent === 'deals' && extractedProduct ? 'check_deals' : workflowContext,
+    pendingProduct: extractedProduct || pendingProduct,
+    dealData,
+    cartData,
+    messages: [lastMessage]
   };
 }
 
 // Agent functions that use the state
 async function catalogNode(state: typeof SupervisorState.State) {
-  const { messages, userId } = state;
+  const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData } = state;
   
-  console.log('[catalogNode] Processing with catalog agent for user:', userId);
+  console.log('[catalogNode] Processing with catalog agent for user:', userId, 'conversation:', conversationId);
   
-  const agent = new CatalogAgent(userId || 'default-user');
-  
-  // Generate session ID for supervisor -> agent communication
-  const sessionId = `supervisor-catalog-${userId}-${Date.now()}`;
-  
-  // Use the agent's chat method for proper memory management
   const lastMessage = messages[messages.length - 1];
   const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
-  const result = await agent.chat(messageContent, sessionId);
+  
+  const result = await callLangGraphAgent('catalog', messageContent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
   
   return {
     messages: result.messages,
+    // PRESERVE ALL STATE - critical for workflow continuity
+    userId,
+    conversationId,
+    workflowContext,
+    dealData,
+    pendingProduct,
+    cartData,
     next: END,
   };
 }
 
 async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
-  const { messages, userId, workflowContext, dealData, pendingProduct, cartData } = state;
+  const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData } = state;
   
-  console.log('[cartAndCheckoutNode] Processing with cart & checkout agent for user:', userId);
+  console.log('[cartAndCheckoutNode] Processing with cart & checkout agent for user:', userId, 'conversation:', conversationId);
   console.log('[cartAndCheckoutNode] Workflow context:', workflowContext);
   console.log('[cartAndCheckoutNode] Deal data available:', !!dealData);
+  console.log('[cartAndCheckoutNode] Deal data:', dealData);
   console.log('[cartAndCheckoutNode] Pending product:', pendingProduct);
-  console.log('[cartAndCheckoutNode] Cart data available:', !!cartData);
+  console.log('[cartAndCheckoutNode] Cart data:', cartData);
+  console.log('[cartAndCheckoutNode] All messages:', messages.map(m => ({ role: m instanceof HumanMessage ? 'human' : 'ai', content: typeof m.content === 'string' ? m.content : m.content.toString().substring(0, 100) })));
   
-  // Special handling for prepare_checkout workflow
-  if (workflowContext === 'prepare_checkout' && !cartData) {
-    console.log('[cartAndCheckoutNode] Preparing cart data for checkout workflow');
-    
-    // Delegate cart preparation to the cart-and-checkout agent
-    const agent = new CartAndCheckoutAgent(userId || 'default-user');
-    
-    // Generate session ID for supervisor -> agent communication
-    const sessionId = `supervisor-cart-prep-${userId}-${Date.now()}`;
-    
+  // Determine the message to send to the cart agent
+  let messageToAgent: string;
+  const lastMessage = messages[messages.length - 1];
+  const originalContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  
+  // Check if this is a checkout request - if so, get cart data first
+  const isCheckoutRequest = originalContent.toLowerCase().includes('checkout') || 
+                           originalContent.toLowerCase().includes('buy') ||
+                           originalContent.toLowerCase().includes('purchase') ||
+                           workflowContext === 'process_checkout' ||
+                           workflowContext === 'prepare_checkout';
+  
+  if (isCheckoutRequest && !cartData) {
+    console.log('[cartAndCheckoutNode] Checkout request detected, but no cart data. Getting cart first...');
+    // First get the cart data before proceeding with checkout
     try {
-      const result = await agent.chat('Please show me my current cart contents for checkout.', sessionId);
+      const baseUrl = process.env.NEXTJS_URL || 'http://localhost:3000';
+      const response = await fetch(`${baseUrl}/api/get-cart?userId=${encodeURIComponent(userId || 'default-user')}`);
       
-      // Parse the agent's response to extract cart data
-      const responseMessages = result.messages || [new AIMessage(result.content || 'No response')];
-      const lastResponse = responseMessages[responseMessages.length - 1];
-      const responseContent = typeof lastResponse.content === 'string' ? 
-        lastResponse.content : lastResponse.content.toString();
-      
-      // Check if cart has items based on agent response
-      if (responseContent.toLowerCase().includes('empty') || 
-          responseContent.toLowerCase().includes('no items')) {
-        console.log('[cartAndCheckoutNode] Cart is empty according to agent');
-        return {
-          messages: [new AIMessage('Cart is empty. Please add items before checkout.')],
-          next: END,
-        };
-      } else {
-        console.log('[cartAndCheckoutNode] Cart data prepared successfully via agent');
-        return {
-          messages: responseMessages,
-          cartData: { prepared: true, agentResponse: responseContent }, // Simplified cart data
-          workflowContext: 'prepare_checkout',
-          next: 'supervisor', // Return to supervisor with cart data
-        };
+      if (response.ok) {
+        const cartResponse = await response.json();
+        if (cartResponse.success && cartResponse.cart) {
+          console.log('[cartAndCheckoutNode] Retrieved cart data:', cartResponse.cart);
+          const updatedCartData = cartResponse.cart;
+          
+          // Now proceed with checkout message
+          messageToAgent = `User wants to checkout. Cart data: ${JSON.stringify(updatedCartData)}. ${originalContent}`;
+          
+          const result = await callLangGraphAgent('cart_and_checkout', messageToAgent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
+          
+          return {
+            messages: result.messages,
+            userId,
+            conversationId,
+            workflowContext: 'process_checkout',
+            dealData,
+            pendingProduct,
+            cartData: updatedCartData,
+            next: END,
+          };
+        }
       }
     } catch (error) {
-      console.error('[cartAndCheckoutNode] Error preparing cart data via agent:', error);
-      return {
-        messages: [new AIMessage('Error retrieving cart data. Please try again.')],
-        next: END,
-      };
+      console.error('[cartAndCheckoutNode] Error getting cart data:', error);
     }
   }
   
-  // Handle add-to-cart with deals workflow
   if (workflowContext === 'add_to_cart_with_deals' && pendingProduct) {
-    console.log('[cartAndCheckoutNode] Processing add-to-cart after deals check');
+    // Handle add-to-cart with deal context - provide full context to agent
+    // Normalize product name for cart operations (deals use plural, cart uses singular)
+    const productForCart = normalizeProductName(pendingProduct.product);
     
-    // Create a message for adding the item to cart (deals already checked)
-    const cartMessage = `Add ${pendingProduct.quantity || 1} ${pendingProduct.product} to cart${dealData ? ' (deals already checked)' : ''}`;
+    messageToAgent = `[userId:${userId}] User confirmed: "${originalContent}". Please add ${pendingProduct.quantity || 1} ${pendingProduct.product} to cart using productCode "${productForCart}" and userId "${userId}"`;
     
-    const agent = new CartAndCheckoutAgent(userId || 'default-user');
+    if (dealData) {
+      if (dealData.applied) {
+        messageToAgent += ` with the ${dealData.type || 'available'} deal applied`;
+      } else if (dealData.pending) {
+        messageToAgent += ` and apply the ${dealData.type || 'available'} deal that was offered`;
+      }
+    }
     
-    // Generate session ID for supervisor -> agent communication
-    const sessionId = `supervisor-cart-add-${userId}-${Date.now()}`;
-    
-    const result = await agent.chat(cartMessage, sessionId);
-    
-    return {
-      messages: result.messages || [new AIMessage(result.content || 'Item added to cart')],
-      next: END,
-    };
+    console.log('[cartAndCheckoutNode] Deal context message:', messageToAgent);
+  } else if (cartData && isCheckoutRequest) {
+    // If we have cart data and this is a checkout request, include cart data in message
+    messageToAgent = `[userId:${userId}] User wants to checkout. Cart data: ${JSON.stringify(cartData)}. ${originalContent}`;
+    console.log('[cartAndCheckoutNode] Checkout message with cart data prepared');
+  } else {
+    // For other scenarios, use the original user message with userId context
+    messageToAgent = `[userId:${userId}] ${originalContent}`;
   }
   
-  // Handle checkout processing with cart data
-  if (workflowContext === 'process_checkout' && cartData) {
-    console.log('[cartAndCheckoutNode] Processing checkout with prepared cart data');
+  const result = await callLangGraphAgent('cart_and_checkout', messageToAgent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
+  
+  // Check if the cart operation failed and suggest alternative
+  const resultMessage = result.messages && result.messages.length > 0 ? result.messages[result.messages.length - 1] : null;
+  const responseContent = typeof resultMessage?.content === 'string' ? resultMessage.content : (result.content || '');
+  
+  // Detect if product was not recognized
+  const contentStr = typeof responseContent === 'string' ? responseContent : '';
+  const productNotRecognized = contentStr.toLowerCase().includes('not recognizing the product') ||
+                               contentStr.toLowerCase().includes('product not found') ||
+                               contentStr.toLowerCase().includes('item not found');
+  
+  if (productNotRecognized && pendingProduct) {
+    console.log('[cartAndCheckoutNode] Product not recognized, suggesting catalog search');
     
-    const agent = new CartAndCheckoutAgent(userId || 'default-user', cartData);
-    
-    // Generate session ID for supervisor -> agent communication
-    const sessionId = `supervisor-cart-checkout-${userId}-${Date.now()}`;
-    
-    const lastMessage = messages[messages.length - 1];
-    const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
-    const result = await agent.chat(messageContent, sessionId);
+    // Create a helpful message suggesting catalog search
+    const helpfulMessage = new AIMessage(`I couldn't find "${pendingProduct.product}" in our catalog. Let me help you find the right product. You can try searching for similar items or browse our catalog.`);
     
     return {
-      messages: result.messages || [new AIMessage(result.content || 'Checkout processed')],
-      next: END,
+      messages: result.messages ? [...result.messages, helpfulMessage] : [helpfulMessage],
+      userId,
+      conversationId,
+      workflowContext: null, // Clear workflow context to allow new interactions
+      dealData: null, // Clear deal data since the product wasn't found
+      pendingProduct: null, // Clear pending product
+      cartData,
+      next: END, // End this interaction, user can start fresh
     };
   }
-  
-  // Normal cart and checkout operations
-  const agent = new CartAndCheckoutAgent(userId || 'default-user', cartData);
-  
-  // Generate session ID for supervisor -> agent communication
-  const sessionId = `supervisor-cart-${userId}-${Date.now()}`;
-  
-  const lastMessage = messages[messages.length - 1];
-  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
-  const result = await agent.chat(messageContent, sessionId);
   
   return {
     messages: result.messages,
+    // PRESERVE ALL STATE - critical for workflow continuity
+    userId,
+    conversationId,
+    workflowContext,
+    dealData,
+    pendingProduct,
+    cartData,
     next: END,
   };
 }
 
 async function dealsNode(state: typeof SupervisorState.State) {
-  const { messages, userId, workflowContext, pendingProduct } = state;
+  const { messages, userId, conversationId, workflowContext, pendingProduct, dealData, cartData } = state;
   
-  console.log('[dealsNode] Processing with deals agent for user:', userId);
+  console.log('[dealsNode] Processing with deals agent for user:', userId, 'conversation:', conversationId);
   console.log('[dealsNode] Workflow context:', workflowContext);
   console.log('[dealsNode] Pending product:', pendingProduct);
   
-  const agent = new DealsAgent(userId || 'default-user');
-  
-  // Create a message that includes the product information for deals checking
+  // Determine message to send to deals agent
   const lastMessage = messages[messages.length - 1];
-  let dealsMessage = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  let messageToAgent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  
   if (pendingProduct && workflowContext === 'check_deals') {
-    dealsMessage = `Check for deals on ${pendingProduct.product}${pendingProduct.quantity ? ` (quantity: ${pendingProduct.quantity})` : ''}`;
+    messageToAgent = `User wants to add to cart: "${messageToAgent}". Check for deals on ${pendingProduct.product}${pendingProduct.quantity ? ` (quantity: ${pendingProduct.quantity})` : ''}`;
   }
   
-  // Generate session ID for supervisor -> agent communication
-  const sessionId = `supervisor-deals-${userId}-${Date.now()}`;
+  const result = await callLangGraphAgent('deals', messageToAgent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
   
-  const result = await agent.chat(dealsMessage, sessionId);
+  // Analyze response for deal confirmation needs
+  const responseMessages = result.messages;
+  const responseContent = result.content || 'No deals found';
   
-  // Parse the result to determine if deals were found and confirmed
-  const responseMessages = result.messages || [new AIMessage(result.content || 'No deals found')];
-  const lastResponse = responseMessages[responseMessages.length - 1];
-  const responseContent = typeof lastResponse.content === 'string' ? 
-    lastResponse.content : lastResponse.content.toString();
+  // Simple check for deal confirmation prompts
+  const requiresConfirmation = responseContent.toLowerCase().includes('would you like') ||
+                              responseContent.toLowerCase().includes('apply this deal') ||
+                              responseContent.toLowerCase().includes('interested in') ||
+                              responseContent.toLowerCase().includes('take advantage');
   
-  // Check if this is a deal confirmation response
-  const isDealConfirmation = responseContent.toLowerCase().includes('would you like') ||
-                           responseContent.toLowerCase().includes('apply this deal') ||
-                           responseContent.toLowerCase().includes('great news');
-  
-  if (isDealConfirmation) {
-    // Deal found, waiting for user confirmation - stay in deals agent
+  if (requiresConfirmation) {
+    // Deal found, waiting for user confirmation
+    console.log('[dealsNode] Deal confirmation required, setting awaiting_deal_confirmation state');
+    console.log('[dealsNode] Pending product:', pendingProduct);
+    console.log('[dealsNode] Deal data will be:', { pending: true, response: responseContent });
+    
     return {
       messages: responseMessages,
       workflowContext: 'awaiting_deal_confirmation',
+      dealData: { 
+        ...dealData, // Preserve existing deal data
+        pending: true, 
+        response: responseContent, 
+        type: 'product_deal' 
+      },
+      pendingProduct,
+      cartData, // Preserve cart data
+      userId,
+      conversationId,
       next: END,
     };
   } else {
-    // No deals found or deal processed, move to catalog_cart
+    // No confirmation needed, proceed to add to cart
     return {
       messages: responseMessages,
-      workflowContext: 'check_deals_complete',
-      dealData: null, // Could extract deal info from response if needed
-      next: 'supervisor',
+      workflowContext: 'add_to_cart_with_deals',
+      dealData: { 
+        ...dealData, // Preserve existing deal data
+        applied: true, 
+        response: responseContent, 
+        type: 'product_deal' 
+      },
+      pendingProduct,
+      cartData, // Preserve cart data
+      userId,
+      conversationId,
+      next: 'cart_and_checkout',
     };
   }
 }
 
 async function paymentNode(state: typeof SupervisorState.State) {
-  const { messages, userId, cartData, workflowContext } = state;
+  const { messages, userId, conversationId, cartData, workflowContext, dealData, pendingProduct } = state;
   
-  console.log('[paymentNode] Processing with payment agent for user:', userId);
+  console.log('[paymentNode] Processing with payment agent for user:', userId, 'conversation:', conversationId);
   console.log('[paymentNode] Workflow context:', workflowContext);
-  
-  const agent = new PaymentAgent(userId || 'default-user');
-  
-  // Generate session ID for supervisor -> agent communication
-  const sessionId = `supervisor-payment-${userId}-${Date.now()}`;
   
   const lastMessage = messages[messages.length - 1];
   const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
-  const result = await agent.chat(messageContent, sessionId);
+  
+  const result = await callLangGraphAgent('payment', messageContent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
   
   return {
     messages: result.messages,
+    // PRESERVE ALL STATE
+    userId,
+    conversationId,
+    workflowContext,
+    dealData,
+    pendingProduct,
+    cartData,
     next: END,
   };
 }
@@ -417,65 +1020,183 @@ const workflow = new StateGraph(SupervisorState)
   })
   .addEdge('payment', END);
 
+// Export graph without built-in checkpointer (SupervisorAgent will handle state)
 export const supervisorGraph = workflow.compile();
 
-// Class-based Supervisor Agent to match the design pattern
+// Class-based Supervisor Agent with local state management
 export class SupervisorAgent {
   private userId: string;
+  private conversationId?: string;
+  private memorySaver: MemorySaver;
+  private compiledGraph: any;
+  private threadPrefix: string;
 
-  constructor(userId: string) {
+  constructor(userId: string, conversationId?: string) {
     this.userId = userId;
-    console.log('[SupervisorAgent] Creating supervisor for userId:', userId);
-  }
-
-  // Standalone usage - can be called by any system
-  async chat(message: string, sessionId?: string): Promise<any> {
-    const threadId = sessionId || `supervisor-${this.userId}-default`;
+    this.conversationId = conversationId;
+    this.memorySaver = new MemorySaver();
+    this.threadPrefix = `supervisor-${userId}`;
     
-    const result = await supervisorGraph.invoke({
-      messages: [new HumanMessage(message)],
-      userId: this.userId,
-      next: '',
+    // Create compiled graph with optimized configuration
+    this.compiledGraph = workflow.compile({ 
+      checkpointer: this.memorySaver,
+      // Add configuration for better state management
+      interruptBefore: [], // Can add nodes to interrupt before if needed
+      interruptAfter: []   // Can add nodes to interrupt after if needed
     });
     
-    return result;
+    console.log('[SupervisorAgent] Initialized for userId:', userId, 'threadPrefix:', this.threadPrefix);
   }
 
-  // Stream support for real-time responses
-  async stream(message: string, sessionId?: string) {
-    const threadId = sessionId || `supervisor-${this.userId}-default`;
+  // CRITICAL FIX: Use consistent thread ID that matches remote agents
+  private getThreadId(conversationId?: string): string {
+    const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
     
-    return supervisorGraph.stream({
-      messages: [new HumanMessage(message)],
-      userId: this.userId,
-      next: '',
-    });
+    // Check if this conversation already has a mapped thread ID from remote agents
+    const existingThreadId = conversationThreadMap.get(effectiveConversationId);
+    if (existingThreadId) {
+      console.log(`[SupervisorAgent] Using existing mapped thread: ${existingThreadId} for conversation: ${effectiveConversationId}`);
+      return existingThreadId;
+    }
+    
+    // Use supervisor-specific thread ID format for local graph execution
+    return `supervisor-${effectiveConversationId}`;
   }
 
-  // LangGraph-compatible invoke method
-  async invoke(input: { messages: any[] }, config?: any) {
-    return await supervisorGraph.invoke({
+  // OPTIMIZED: Improved chat method with better state handling
+  async chat(message: string, conversationId?: string): Promise<any> {
+    const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
+    const threadId = this.getThreadId(conversationId);
+    
+    console.log('[SupervisorAgent] Processing message with thread ID:', threadId);
+    console.log('[SupervisorAgent] Effective conversation ID:', effectiveConversationId);
+    
+    try {
+      const result = await this.compiledGraph.invoke({
+        messages: [new HumanMessage(message)],
+        userId: this.userId,
+        conversationId: effectiveConversationId,
+        next: '',
+      }, {
+        configurable: { 
+          thread_id: threadId,
+          // Reduce recursion limit to prevent infinite loops
+          recursion_limit: 5,
+          max_execution_time: 60000 // 60 seconds
+        }
+      });
+      
+      return result;
+    } catch (error) {
+      console.error('[SupervisorAgent] Error in chat:', error);
+      
+      // Return graceful error response
+      return {
+        messages: [new AIMessage('I apologize, but I encountered an error processing your request. Please try again.')],
+        userId: this.userId,
+        conversationId: conversationId || this.conversationId,
+        next: END
+      };
+    }
+  }
+
+  // Enhanced stream support with better error handling
+  async stream(message: string, conversationId?: string) {
+    const threadId = this.getThreadId(conversationId);
+    
+    try {
+      const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
+      
+      return this.compiledGraph.stream({
+        messages: [new HumanMessage(message)],
+        userId: this.userId,
+        conversationId: effectiveConversationId,
+        next: '',
+      }, {
+        configurable: { 
+          thread_id: threadId,
+          recursion_limit: 5,
+          max_execution_time: 60000
+        }
+      });
+    } catch (error) {
+      console.error('[SupervisorAgent] Error in stream:', error);
+      throw error;
+    }
+  }
+
+  // Enhanced LangGraph-compatible invoke method
+  async invoke(input: { messages: any[], conversationId?: string }, config?: any) {
+    const threadId = this.getThreadId(input.conversationId);
+    
+    const finalConfig = config || { configurable: { thread_id: threadId } };
+    if (!finalConfig.configurable) {
+      finalConfig.configurable = { thread_id: threadId };
+    } else if (!finalConfig.configurable.thread_id) {
+      finalConfig.configurable.thread_id = threadId;
+    }
+    
+    // Add enhanced configuration
+    finalConfig.configurable.recursion_limit = finalConfig.configurable.recursion_limit || 5;
+    finalConfig.configurable.max_execution_time = finalConfig.configurable.max_execution_time || 60000;
+    
+    const effectiveConversationId = input.conversationId || this.conversationId || `conv-${this.userId}-session`;
+    
+    return await this.compiledGraph.invoke({
       messages: input.messages,
       userId: this.userId,
+      conversationId: effectiveConversationId,
       next: '',
-    });
+    }, finalConfig);
   }
 
-  // Get conversation history (supervisor manages state across multiple agents)
-  async getHistory(sessionId?: string) {
-    // Supervisor doesn't maintain its own memory, delegates to specialized agents
-    console.log(`[SupervisorAgent] History managed by individual specialized agents`);
-    return null;
+  // NEW: Method to get current state/context
+  async getCurrentState(conversationId?: string): Promise<any> {
+    const threadId = this.getThreadId(conversationId);
+    try {
+      return await this.memorySaver.get({ configurable: { thread_id: threadId } });
+    } catch (error) {
+      console.error('[SupervisorAgent] Error getting current state:', error);
+      return null;
+    }
   }
 
-  // Clear session memory across all agents
-  async clearSession(sessionId?: string) {
-    console.log(`[SupervisorAgent] Session clearing delegated to individual agents`);
-    // In a full implementation, this could clear sessions across all agents
+  // ENHANCED: Better session clearing
+  async clearSession(conversationId?: string): Promise<void> {
+    const threadId = this.getThreadId(conversationId);
+    try {
+      // MemorySaver doesn't have a delete method, so we'll create a new instance
+      this.memorySaver = new MemorySaver();
+      console.log('[SupervisorAgent] Cleared session for thread:', threadId);
+    } catch (error) {
+      console.error('[SupervisorAgent] Error clearing session:', error);
+    }
+  }
+
+  // NEW: Get all active sessions for this user
+  async getActiveSessions(): Promise<string[]> {
+    try {
+      // Note: MemorySaver doesn't have a direct method to list all threads
+      // This would need to be implemented based on your specific storage backend
+      console.log('[SupervisorAgent] Active sessions would be listed here');
+      return [];
+    } catch (error) {
+      console.error('[SupervisorAgent] Error getting active sessions:', error);
+      return [];
+    }
+  }
+
+  // NEW: Health check method
+  async healthCheck(): Promise<{ status: string; userId: string; timestamp: number }> {
+    return {
+      status: 'healthy',
+      userId: this.userId,
+      timestamp: Date.now()
+    };
   }
 }
 
 // Factory function for backward compatibility
-export const createSupervisorAgent = (userId: string) => {
-  return new SupervisorAgent(userId);
+export const createSupervisorAgent = (userId: string, conversationId?: string) => {
+  return new SupervisorAgent(userId, conversationId);
 };

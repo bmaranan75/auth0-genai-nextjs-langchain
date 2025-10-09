@@ -1,34 +1,115 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cartCache, type CartItem, Cart } from '@/lib/cache/cart-cache';
 
+/**
+ * Normalize product codes from plural to singular form
+ */
+function normalizeProductCode(productCode: string): string {
+  const normalized = productCode.toLowerCase().trim();
+  
+  const pluralToSingular: { [key: string]: string } = {
+    'apples': 'apple',
+    'bananas': 'banana', 
+    'oranges': 'orange',
+    'carrots': 'carrots', // already singular in catalog
+    'potatoes': 'potato',
+    'tomatoes': 'tomato',
+    'onions': 'onion',
+    'eggs': 'egg',
+    'breads': 'bread',
+    'milks': 'milk',
+    'cheeses': 'cheese',
+    'yogurts': 'yogurt',
+    'cereals': 'cereal'
+  };
+  
+  return pluralToSingular[normalized] || normalized;
+}
+
 async function findProduct(productCode?: string, productName?: string) {
   // First, try to find the product in the local catalog
   let product = null;
   
-  // If product not found locally, call the catalog API
-  if (!product) {
-    try {
-      const baseUrl = process.env.NEXTAUTH_URL || 'http://localhost:3000';
+  try {
+    const baseUrl = process.env.NEXTAUTH_URL || 'http://localhost:3000';
+    
+    if (productCode) {
+      console.log(`[findProduct] Searching by productCode: ${productCode}`);
+      // Search by exact product code using POST
+      const response = await fetch(`${baseUrl}/api/catalog`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ productCode }),
+      });
       
-      if (productCode) {
-        // Search by exact product code using POST
+      if (response.ok) {
+        const data = await response.json();
+        product = data.product;
+        console.log(`[findProduct] Found product by code:`, product);
+      } else {
+        console.log(`[findProduct] Product not found by exact code: ${productCode}`);
+        // Try normalizing the productCode if exact match failed
+        const normalizedCode = normalizeProductCode(productCode);
+        if (normalizedCode !== productCode) {
+          console.log(`[findProduct] Trying normalized code: ${normalizedCode}`);
+          const normalizedResponse = await fetch(`${baseUrl}/api/catalog`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ productCode: normalizedCode }),
+          });
+          
+          if (normalizedResponse.ok) {
+            const normalizedData = await normalizedResponse.json();
+            product = normalizedData.product;
+            console.log(`[findProduct] Found product by normalized code:`, product);
+          }
+        }
+      }
+    }
+    
+    // If not found by productCode and we have productName, try searching by name
+    if (!product && productName) {
+      console.log(`[findProduct] Trying to search by productName: ${productName}`);
+      // Try common name-to-code mappings
+      const normalizedName = productName.toLowerCase().trim();
+      const nameToCode: { [key: string]: string } = {
+        'apples': 'apple',
+        'apple': 'apple',
+        'bananas': 'banana',
+        'banana': 'banana',
+        'oranges': 'orange',
+        'orange': 'orange',
+        'carrots': 'carrots',
+        'carrot': 'carrots',
+        'milk': 'milk',
+        'cheese': 'cheese'
+      };
+      
+      const mappedCode = nameToCode[normalizedName];
+      if (mappedCode) {
+        console.log(`[findProduct] Mapped ${productName} to code: ${mappedCode}`);
         const response = await fetch(`${baseUrl}/api/catalog`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ productCode }),
+          body: JSON.stringify({ productCode: mappedCode }),
         });
         
         if (response.ok) {
           const data = await response.json();
           product = data.product;
+          console.log(`[findProduct] Found product by mapped name:`, product);
         }
-      } 
-    } catch (error) {
-      console.error('[findProduct] Error calling catalog API:', error);
-      // Fall through to return null if API call fails
+      }
     }
+  } catch (error) {
+    console.error('[findProduct] Error calling catalog API:', error);
+    // Fall through to return null if API call fails
   }
   
   return product;

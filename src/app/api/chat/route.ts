@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
     };
 
     const body = await req.json();
-    const { messages } = body;
+    const { messages, conversationId } = body;
     
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return NextResponse.json({
@@ -45,14 +45,15 @@ export async function POST(req: NextRequest) {
       // Reset authorization state before processing
       resetAuthorizationState();
       
-      // Create a new multi-agent instance with the userId for each request
+      // Create a new multi-agent instance with the userId and conversationId for each request
       // This uses the supervisor agent to route to specialized agents
-      const agent = createAgent(userId ?? '');
+      const agent = createAgent(userId ?? '', conversationId);
 
       // Use the agent with proper Auth0 context and timeout handling  
       const result = await Promise.race([
         agent.invoke({
-          messages: [new HumanMessage(lastMessage.content)]
+          messages: [new HumanMessage(lastMessage.content)],
+          conversationId
         }),
         // Add timeout protection for Vercel
         new Promise((_, reject) => 
