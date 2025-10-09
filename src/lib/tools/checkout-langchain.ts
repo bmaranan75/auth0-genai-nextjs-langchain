@@ -73,23 +73,54 @@ export const checkoutCartTool = tool(
       if (!apiUrl.includes('localhost:3000')) {
         throw new Error(`Checkout failed: ${response.status} - ${errorText}`);
       } else {
-        // Mock response for local testing
+        // Mock structured response for local testing
         const totalValue = cartData?.totalValue || 0;
-        
         // Reset authorization state after successful mock checkout
         resetShopAuthState();
-        
-        return `Successfully processed checkout for cart totaling $${totalValue.toFixed(2)}. Order has been placed and will be processed for delivery.`;
+        return JSON.stringify({
+          checkoutStatus: 'success',
+          orderId: `LOCAL-${Date.now()}`,
+          summary: `Order placed for cart totaling $${totalValue.toFixed(2)}`,
+          items: cartData?.items || null,
+          total: totalValue
+        });
       }
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const json = await response.json();
+      resetShopAuthState();
+      return JSON.stringify({
+        checkoutStatus: json.checkoutStatus || 'success',
+        orderId: json.orderId || json.id || null,
+        summary: json.summary || json.message || JSON.stringify(json),
+        items: json.items || json.cart?.items || cartData?.items || null,
+        total: json.total || json.cart?.total || cartData?.total || null
+      });
     }
 
     const result = await response.text();
     console.log(`[checkout-cart-tool] API response: ${result}`);
-    
-    // Reset authorization state after successful checkout
     resetShopAuthState();
-    
-    return result || `Successfully processed your cart checkout.`;
+    try {
+      const parsed = JSON.parse(result);
+      return JSON.stringify({
+        checkoutStatus: parsed.checkoutStatus || 'success',
+        orderId: parsed.orderId || parsed.id || null,
+        summary: parsed.summary || parsed.message || result,
+        items: parsed.items || parsed.cart?.items || cartData?.items || null,
+        total: parsed.total || parsed.cart?.total || cartData?.total || null
+      });
+    } catch (_e) {
+      return JSON.stringify({
+        checkoutStatus: 'success',
+        orderId: `RESP-${Date.now()}`,
+        summary: result,
+        items: cartData?.items || null,
+        total: cartData?.total || null
+      });
+    }
   },
   {
     name: 'checkout_cart',

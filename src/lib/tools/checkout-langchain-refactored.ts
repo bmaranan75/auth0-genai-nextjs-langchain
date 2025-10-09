@@ -78,15 +78,53 @@ export const createCheckoutCartTool = (cartData: any) => tool(
         if (!apiUrl.includes('localhost:3000')) {
           throw new Error(`Checkout failed: ${response.status} - ${errorText}`);
         } else {
-          // Mock response for local testing
+          // Mock structured response for local testing
           const totalValue = processedCartData?.totalValue || processedCartData?.total || 0;
-          return `Successfully processed checkout for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}. Order has been placed and will be processed for delivery.`;
+          return JSON.stringify({
+            checkoutStatus: 'success',
+            orderId: `LOCAL-${Date.now()}`,
+            summary: `Order placed for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}`,
+            items: processedCartData?.items || processedCartData?.lineItems || null,
+            total: totalValue
+          });
         }
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const json = await response.json();
+        // Expect the API to return structured data. If it already includes our shape, return it.
+        return JSON.stringify({
+          checkoutStatus: json.checkoutStatus || 'success',
+          orderId: json.orderId || json.id || null,
+          summary: json.summary || json.message || JSON.stringify(json),
+          items: json.items || json.cart?.items || processedCartData?.items || null,
+          total: json.total || json.cart?.total || processedCartData?.total || null
+        });
       }
 
       const result = await response.text();
       console.log(`[checkout-cart-tool] API response: ${result}`);
-      return result || `Successfully processed your cart checkout.`;
+      // Try to extract JSON from text response
+      try {
+        const parsed = JSON.parse(result);
+        return JSON.stringify({
+          checkoutStatus: parsed.checkoutStatus || 'success',
+          orderId: parsed.orderId || parsed.id || null,
+          summary: parsed.summary || parsed.message || result,
+          items: parsed.items || parsed.cart?.items || processedCartData?.items || null,
+          total: parsed.total || parsed.cart?.total || processedCartData?.total || null
+        });
+      } catch (_e) {
+        // Return a structured wrapper around the textual result
+        return JSON.stringify({
+          checkoutStatus: 'success',
+          orderId: `RESP-${Date.now()}`,
+          summary: result,
+          items: processedCartData?.items || null,
+          total: processedCartData?.total || null
+        });
+      }
     } finally {
       dynamicCheckoutToolRunning = false;
     }
@@ -150,15 +188,50 @@ export const checkoutCartTool = tool(
       if (!apiUrl.includes('localhost:3000')) {
         throw new Error(`Checkout failed: ${response.status} - ${errorText}`);
       } else {
-        // Mock response for local testing
+        // Mock structured response for local testing
         const totalValue = processedCartData?.totalValue || processedCartData?.total || 0;
-        return `Successfully processed checkout for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}. Order has been placed and will be processed for delivery.`;
+        return JSON.stringify({
+          checkoutStatus: 'success',
+          orderId: `LOCAL-${Date.now()}`,
+          summary: `Order placed for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}`,
+          items: processedCartData?.items || processedCartData?.lineItems || null,
+          total: totalValue
+        });
       }
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const json = await response.json();
+      return JSON.stringify({
+        checkoutStatus: json.checkoutStatus || 'success',
+        orderId: json.orderId || json.id || null,
+        summary: json.summary || json.message || JSON.stringify(json),
+        items: json.items || json.cart?.items || processedCartData?.items || null,
+        total: json.total || json.cart?.total || processedCartData?.total || null
+      });
     }
 
     const result = await response.text();
     console.log(`[checkout-cart-tool] API response: ${result}`);
-    return result || `Successfully processed your cart checkout.`;
+    try {
+      const parsed = JSON.parse(result);
+      return JSON.stringify({
+        checkoutStatus: parsed.checkoutStatus || 'success',
+        orderId: parsed.orderId || parsed.id || null,
+        summary: parsed.summary || parsed.message || result,
+        items: parsed.items || parsed.cart?.items || processedCartData?.items || null,
+        total: parsed.total || parsed.cart?.total || processedCartData?.total || null
+      });
+    } catch (_e) {
+      return JSON.stringify({
+        checkoutStatus: 'success',
+        orderId: `RESP-${Date.now()}`,
+        summary: result,
+        items: processedCartData?.items || null,
+        total: processedCartData?.total || null
+      });
+    }
   },
   {
     name: 'checkout_cart',
@@ -371,9 +444,15 @@ const recursionSafeCheckoutCartTool = tool(
         if (!apiUrl.includes('localhost:3000')) {
           throw new Error(`Checkout failed: ${response.status} - ${errorText}`);
         } else {
-          // Mock response for local testing
+          // Mock structured response for local testing
           const totalValue = processedCartData?.totalValue || processedCartData?.total || 0;
-          return `Successfully processed checkout for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}. Order has been placed and will be processed for delivery.`;
+          return JSON.stringify({
+            checkoutStatus: 'success',
+            orderId: `LOCAL-${Date.now()}`,
+            summary: `Order placed for cart totaling $${totalValue.toFixed ? totalValue.toFixed(2) : totalValue}`,
+            items: processedCartData?.items || processedCartData?.lineItems || null,
+            total: totalValue
+          });
         }
       }
 

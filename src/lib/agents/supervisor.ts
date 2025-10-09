@@ -205,6 +205,15 @@ const SupervisorState = Annotation.Root({
       return y;
     },
   }),
+  // notificationData: stores payload for post-checkout notifications (e.g., order id, summary)
+  notificationData: Annotation<any>({
+    reducer: (x, y) => {
+      if (y === null) return null; // Explicit clear
+      if (!y) return x;
+      if (!x) return y;
+      return { ...x, ...y };
+    },
+  }),
 });
 
 const llm = new ChatOpenAI({
@@ -244,6 +253,9 @@ const globalLangGraphClient = new LangGraphClient(LANGGRAPH_SERVER_URL);
 async function callLangGraphAgent(opts: AgentCallOptions): Promise<AgentCallResult> {
   return globalLangGraphClient.callAgentWithStream(opts);
 }
+
+// Exported for testing/mocking
+export { callLangGraphAgent };
 
 // LangGraphClient implementation was extracted to src/lib/agents/langgraphClient.ts
 
@@ -624,7 +636,7 @@ async function catalogNode(state: typeof SupervisorState.State) {
   };
 }
 
-async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
+export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
   const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData } = state;
   
   console.log('[cartAndCheckoutNode] Processing with cart & checkout agent for user:', userId, 'conversation:', conversationId);
@@ -681,7 +693,12 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
   
   // Build compact context for cart agent and prepend detailed action instructions
   const cartContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'cart_and_checkout', originalContent);
-  const fullCartMessage = `${cartContext}\n\n${messageToAgent}`;
+
+  // Request structured JSON when performing checkout so the supervisor can reliably detect success.
+  // Instruct the cart agent: when completing a checkout return ONLY a JSON object with the following shape.
+  const structuredInstruction = `\n\nIF YOU COMPLETE A CHECKOUT, RETURN ONLY A JSON OBJECT WITH THIS SHAPE (no additional text):\n{\n  "checkoutStatus": "success" | "failure",\n  "orderId": string | null,\n  "summary": string | null,\n  "items": Array<any> | null,\n  "total": number | null\n}\nIf no checkout was performed, return your normal assistant text.`;
+
+  const fullCartMessage = `${cartContext}\n\n${messageToAgent}${structuredInstruction}`;
   const result = await callLangGraphAgent({ agentId: 'cart_and_checkout', message: fullCartMessage, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
 
   const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'cart_and_checkout'));
@@ -713,7 +730,88 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
       next: END, // End this interaction, user can start fresh
     };
   }
-  
+  // Prefer structured JSON response from cart agent for checkout detection
+  const structured = safeParseJson<{
+    checkoutStatus?: 'success' | 'failure';
+    orderId?: string | null;
+    summary?: string | null;
+    items?: any[] | null;
+    total?: number | null;
+  }>(contentStr);
+
+  if (structured && structured.checkoutStatus) {
+    if (structured.checkoutStatus === 'success') {
+      console.log('[cartAndCheckoutNode] Structured checkout success detected with orderId:', structured.orderId);
+      const notificationPayload = {
+        userId,
+        conversationId,
+        summary: structured.summary || contentStr,
+        cartData: structured.items || cartData,
+        orderId: structured.orderId || null,
+        total: structured.total || null,
+        timestamp: Date.now()
+      };
+
+      return {
+        messages: annotatedResponses,
+        userId,
+        conversationId,
+        workflowContext: null,
+        dealData,
+        pendingProduct: null,
+        cartData: null, // clear cart after successful checkout
+        notificationData: notificationPayload,
+        next: 'notification_agent'
+      };
+    }
+
+    if (structured.checkoutStatus === 'failure') {
+      console.log('[cartAndCheckoutNode] Structured checkout failure detected');
+      const failMessage = new AIMessage(`Checkout failed: ${structured.summary || 'Unknown reason'}`);
+      return {
+        messages: annotatedResponses ? [...annotatedResponses, annotateMessage(failMessage, 'assistant', 'cart_and_checkout')] : [annotateMessage(failMessage, 'assistant', 'cart_and_checkout')],
+        userId,
+        conversationId,
+        workflowContext: null,
+        dealData,
+        pendingProduct: null,
+        cartData,
+        next: END
+      };
+    }
+  }
+
+  // Fallback: Inspect responseContent for confirmation of successful checkout using text heuristics.
+  const checkoutSuccess = contentStr.toLowerCase().includes('checkout completed') ||
+                          contentStr.toLowerCase().includes('order confirmed') ||
+                          contentStr.toLowerCase().includes('payment successful') ||
+                          contentStr.toLowerCase().includes('order placed');
+
+  if (checkoutSuccess) {
+    console.log('[cartAndCheckoutNode] Detected successful checkout (text fallback) - preparing notification');
+
+    // Build a simple notification payload
+    const notificationPayload = {
+      userId,
+      conversationId,
+      summary: contentStr,
+      cartData,
+      timestamp: Date.now()
+    };
+
+    return {
+      messages: annotatedResponses,
+      userId,
+      conversationId,
+      workflowContext: null,
+      dealData,
+      pendingProduct: null,
+      cartData: null, // clear cart after successful checkout
+      notificationData: notificationPayload,
+      next: 'notification_agent'
+    };
+  }
+
   return {
     messages: annotatedResponses,
     // PRESERVE ALL STATE - critical for workflow continuity
@@ -826,11 +924,79 @@ async function paymentNode(state: typeof SupervisorState.State) {
   };
 }
 
+// Simple Pushover client helper - uses fetch to call Pushover API
+// Expects environment variables: PUSHOVER_TOKEN (application token), PUSHOVER_USER (user key)
+import fetch from 'node-fetch';
+
+async function sendPushoverNotification(payload: { title: string; message: string; user?: string; token?: string }) {
+  const token = payload.token || process.env.PUSHOVER_TOKEN;
+  const user = payload.user || process.env.PUSHOVER_USER;
+
+  if (!token || !user) {
+    console.warn('[notification_agent] Missing Pushover configuration (PUSHOVER_TOKEN/PUSHOVER_USER)');
+    return { ok: false, error: 'Missing pushover config' };
+  }
+
+  const form = new URLSearchParams();
+  form.append('token', token);
+  form.append('user', user);
+  form.append('title', payload.title);
+  form.append('message', payload.message);
+
+  try {
+    const res = await fetch('https://api.pushover.net/1/messages.json', {
+      method: 'POST',
+      body: form
+    });
+    const json = await res.json();
+    return { ok: res.ok, result: json };
+  } catch (error) {
+    console.error('[notification_agent] Error sending pushover notification:', error);
+    return { ok: false, error };
+  }
+}
+
+async function notificationAgent(state: typeof SupervisorState.State) {
+  const { notificationData, userId, conversationId } = state as any;
+
+  console.log('[notificationAgent] Running notification agent for user:', userId, 'conversation:', conversationId);
+  if (!notificationData) {
+    console.log('[notificationAgent] No notificationData present - nothing to send');
+    return {
+      messages: [new AIMessage('No notification to send.')],
+      userId,
+      conversationId,
+      workflowContext: null,
+      notificationData: null,
+      next: END
+    };
+  }
+
+  const title = `Order Confirmation - ${userId}`;
+  const message = `Your order was completed. Summary: ${notificationData.summary || "(no summary)"}`;
+
+  const sendResult = await sendPushoverNotification({ title, message });
+
+  const feedbackMessage = sendResult.ok
+    ? new AIMessage('Notification sent successfully.')
+    : new AIMessage(`Failed to send notification: ${sendResult.error || JSON.stringify(sendResult.result)}`);
+
+  return {
+    messages: [annotateMessage(feedbackMessage, 'assistant', 'notification_agent')],
+    userId,
+    conversationId,
+    workflowContext: null,
+    notificationData: null, // clear after sending
+    next: END
+  };
+}
+
 // Build the graph
 const workflow = new StateGraph(SupervisorState)
   .addNode('supervisor', supervisor)
   .addNode('catalog', catalogNode)
   .addNode('cart_and_checkout', cartAndCheckoutNode)
+  .addNode('notification_agent', notificationAgent)
   .addNode('payment', paymentNode)
   .addNode('deals', dealsNode)
   .addEdge(START, 'supervisor')
@@ -846,9 +1012,14 @@ const workflow = new StateGraph(SupervisorState)
   })
   .addConditionalEdges('cart_and_checkout', (state) => state.next, {
     supervisor: 'supervisor',
+    notification_agent: 'notification_agent',
     [END]: END,
   })
   .addConditionalEdges('deals', (state) => state.next, {
+    supervisor: 'supervisor',
+    [END]: END,
+  })
+  .addConditionalEdges('notification_agent', (state) => state.next, {
     supervisor: 'supervisor',
     [END]: END,
   })
@@ -1074,3 +1245,6 @@ export class SupervisorAgent {
 export const createSupervisorAgent = (userId: string, conversationId?: string) => {
   return new SupervisorAgent(userId, conversationId);
 };
+
+// Export internal helpers for testing
+export { notificationAgent, sendPushoverNotification, END };
