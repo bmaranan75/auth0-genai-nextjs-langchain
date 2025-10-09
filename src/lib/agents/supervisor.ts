@@ -26,6 +26,60 @@ import { MemorySaver } from '@langchain/langgraph';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages';
 
+// Annotated message wrapper so we know which agent produced/handled each message
+type AgentRole = 'user' | 'assistant' | 'system';
+interface AnnotatedMessage {
+  message: HumanMessage | AIMessage | SystemMessage;
+  role: AgentRole;
+  agent?: string;        // e.g. 'catalog', 'cart_and_checkout', 'deals', 'payment'
+  senderId?: string;     // optional identifier of agent or external source
+  timestamp: number;
+}
+
+// Helper to wrap messages consistently
+export function annotateMessage(msg: HumanMessage | AIMessage | SystemMessage, role: AgentRole, agent?: string, senderId?: string): AnnotatedMessage {
+  return {
+    message: msg,
+    role,
+    agent,
+    senderId,
+    timestamp: Date.now()
+  };
+}
+
+// Build a compact context string for specialized agents.
+// Include: recent user messages (always), system messages, and assistant messages produced by the same agent.
+// Limit entries to avoid large payloads.
+export function buildAgentContextMessage(
+  annotatedMessages: Array<AnnotatedMessage>,
+  targetAgent: string,
+  currentUserMessage: string,
+  maxEntries = 6
+): string {
+  const filtered = annotatedMessages
+    .filter(m => {
+      // Always include user messages and system messages
+      if (m.role === 'user' || m.role === 'system') return true;
+      // Include assistant messages only if produced by the target agent
+      if (m.role === 'assistant' && m.agent === targetAgent) return true;
+      return false;
+    })
+    .slice(-maxEntries); // take last N relevant entries
+
+  // Compose lines with agent/source annotation to help the LLM quickly contextualize
+  const lines = filtered.map(m => {
+    const content = typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content);
+    const src = m.role === 'assistant' ? (m.agent || 'assistant') : (m.role === 'system' ? 'system' : 'user');
+    return `${src.toUpperCase()}: ${content}`;
+  });
+
+  // Add the current user message at the end (most relevant)
+  lines.push(`USER_LATEST: ${currentUserMessage}`);
+
+  // Keep the context compact
+  return lines.join('\n\n');
+}
+
 /**
  * Normalize product names from plural/conversational form to product code format
  * This helps bridge the gap between how users speak and how products are stored
@@ -70,7 +124,7 @@ function normalizeProductName(productName: string): string {
  * - pendingProduct: Product info with structure validation
  */
 const SupervisorState = Annotation.Root({
-  messages: Annotation<Array<HumanMessage | SystemMessage | AIMessage>>({
+  messages: Annotation<Array<AnnotatedMessage>>({
     reducer: (x, y) => {
       const combined = x.concat(y);
       // Limit message history to prevent memory bloat (keep last 10 messages)
@@ -166,26 +220,51 @@ const LANGGRAPH_SERVER_URL = 'http://localhost:2024';
 import LangGraphClient, { conversationThreadMap, conversationThreadTimestamps, AgentCallOptions, AgentCallResult } from './langgraphClient';
 
 // Clean up old conversation mappings (prevent memory leaks)
+// Use TTL-based eviction to avoid clearing active sessions unexpectedly.
 setInterval(() => {
-  // Keep mappings for 1 hour, then clean up
-  // In production, this should be more sophisticated with proper expiration tracking
-  if (conversationThreadMap.size > 100) {
-    console.log(`[callLangGraphAgent] Cleaning up thread mappings, current size: ${conversationThreadMap.size}`);
-    conversationThreadMap.clear();
+  const TTL = 60 * 60 * 1000; // 1 hour
+  const now = Date.now();
+  for (const [convId, ts] of conversationThreadTimestamps.entries()) {
+    if (now - ts > TTL) {
+      conversationThreadTimestamps.delete(convId);
+      conversationThreadMap.delete(convId);
+      console.log(`[supervisor] Evicted stale conversation: ${convId}`);
+    }
   }
-}, 60 * 60 * 1000); // 1 hour
+  // Occasional logging for visibility
+  if (conversationThreadMap.size > 0) {
+    console.log(`[supervisor] Active thread mappings: ${conversationThreadMap.size}`);
+  }
+}, 10 * 60 * 1000); // run every 10 minutes
+
+// Create a singleton LangGraphClient to reuse connections across calls
+const globalLangGraphClient = new LangGraphClient(LANGGRAPH_SERVER_URL);
 
 // Enhanced helper function to call LangGraph services via HTTP with retry logic
 async function callLangGraphAgent(opts: AgentCallOptions): Promise<AgentCallResult> {
-  // Delegate to LangGraphClient
-  const client = new LangGraphClient(LANGGRAPH_SERVER_URL);
-  return client.callAgentWithStream(opts);
+  return globalLangGraphClient.callAgentWithStream(opts);
 }
 
 // LangGraphClient implementation was extracted to src/lib/agents/langgraphClient.ts
 
 // Enhanced product information extraction using LLM
-async function extractProductInfo(content: string): Promise<{ product: string; quantity?: number } | null> {
+// Safely parse JSON blocks returned by LLMs (tries direct parse, then extracts first JSON object)
+export function safeParseJson<T = any>(text: string): T | null {
+  if (!text || typeof text !== 'string') return null;
+  try {
+    return JSON.parse(text) as T;
+  } catch (_e) {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]) as T;
+    } catch (_e2) {
+      return null;
+    }
+  }
+}
+
+export async function extractProductInfo(content: string): Promise<{ product: string; quantity?: number } | null> {
   const extractionPrompt = new SystemMessage(`Extract product information from this user message.
 
 Look for:
@@ -204,9 +283,8 @@ User message: "${content}"`);
 
   try {
     const response = await llm.invoke([extractionPrompt]);
-    const extraction = JSON.parse(response.content.toString());
-    
-    if (extraction.product) {
+    const extraction = safeParseJson<{ product: string | null; quantity?: number | null }>(response.content.toString());
+    if (extraction && extraction.product) {
       return {
         product: extraction.product,
         quantity: extraction.quantity || undefined
@@ -220,9 +298,9 @@ User message: "${content}"`);
 }
 
 // Enhanced continuation detection using LLM with conversation history
-async function detectContinuationIntent(
+export async function detectContinuationIntent(
   message: string, 
-  messages: Array<HumanMessage | SystemMessage | AIMessage>, 
+  messages: Array<AnnotatedMessage>, 
   workflowContext?: string, 
   dealData?: any, 
   pendingProduct?: any
@@ -246,14 +324,10 @@ async function detectContinuationIntent(
     contextInfo = `CONTEXT: Pending product: ${pendingProduct.product}.`;
   }
 
-  // IMPROVED: Better conversation history with proper message type handling
-  const recentMessages = messages.slice(-4).map(msg => {
-    let role = 'Unknown';
-    if (msg instanceof HumanMessage) role = 'User';
-    else if (msg instanceof AIMessage) role = 'Assistant';
-    else if (msg instanceof SystemMessage) role = 'System';
-    
-    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+  // IMPROVED: Better conversation history from AnnotatedMessage
+  const recentMessages = messages.slice(-6).map(msg => {
+    const role = msg.role === 'user' ? 'User' : msg.role === 'assistant' ? `${msg.agent || 'Assistant'}` : 'System';
+    const content = typeof msg.message.content === 'string' ? msg.message.content : JSON.stringify(msg.message.content);
     return `${role}: ${content.substring(0, 150)}${content.length > 150 ? '...' : ''}`;
   }).join('\n');
 
@@ -291,7 +365,7 @@ Return JSON:
 
   try {
     const response = await llm.invoke([analysisPrompt]);
-    const analysis = JSON.parse(response.content.toString());
+    const analysis = safeParseJson<{ isContinuation: boolean; continuationType: string; targetAgent: string; confidence: number; reasoning?: string }>(response.content.toString()) || {} as any;
     
     // ENHANCED: Additional validation for critical contexts
     if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
@@ -362,8 +436,10 @@ Return JSON:
 // Supervisor function to route requests
 async function supervisor(state: typeof SupervisorState.State) {
   const { messages, userId, conversationId, cartData, workflowContext, dealData, pendingProduct } = state;
-  const lastMessage = messages[messages.length - 1];
-  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
+  const messageContent = lastAnnotated && lastAnnotated.message
+    ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
+    : '';
   
   console.log(`[supervisor] Current workflow context: ${workflowContext}`);
   console.log(`[supervisor] Cart data available: ${!!cartData}`);
@@ -389,7 +465,7 @@ async function supervisor(state: typeof SupervisorState.State) {
           workflowContext: 'add_to_cart_with_deals',
           dealData,
           pendingProduct,
-          messages: [lastMessage] // Preserve the user's response message
+    messages: lastAnnotated ? [lastAnnotated] : [] // Preserve the user's response message if present
         };
         
       case 'checkout_flow':
@@ -399,7 +475,7 @@ async function supervisor(state: typeof SupervisorState.State) {
           conversationId,
           workflowContext: cartData ? 'process_checkout' : 'prepare_checkout',
           cartData,
-          messages: [lastMessage]
+          messages: lastAnnotated ? [lastAnnotated] : []
         };
         
       case 'add_to_cart':
@@ -410,7 +486,7 @@ async function supervisor(state: typeof SupervisorState.State) {
           workflowContext: pendingProduct ? 'add_to_cart_with_deals' : 'check_deals',
           dealData,
           pendingProduct,
-          messages: [lastMessage]
+    messages: lastAnnotated ? [lastAnnotated] : []
         };
     }
   }
@@ -425,7 +501,7 @@ async function supervisor(state: typeof SupervisorState.State) {
       workflowContext: 'add_to_cart_with_deals',
       dealData,
       pendingProduct,
-      messages: [lastMessage]
+  messages: lastAnnotated ? [lastAnnotated] : []
     };
   }
   
@@ -451,7 +527,7 @@ async function supervisor(state: typeof SupervisorState.State) {
         workflowContext: 'add_to_cart_with_deals',
         dealData,
         pendingProduct,
-        messages: [lastMessage]
+  messages: [lastAnnotated]
       };
     }
   }
@@ -488,7 +564,8 @@ Respond with ONLY the agent name: catalog, cart_and_checkout, payment, or deals
 
 User message: "${messageContent}"`);
 
-  const response = await llm.invoke([systemMessage, lastMessage]);
+  const invokeMessages = lastAnnotated?.message ? [systemMessage, lastAnnotated.message] : [systemMessage];
+  const response = await llm.invoke(invokeMessages as any);
   const nextAgent = response.content.toString().trim().toLowerCase();
   
   // Validate and route
@@ -512,7 +589,7 @@ User message: "${messageContent}"`);
     pendingProduct: extractedProduct || pendingProduct,
     dealData,
     cartData,
-    messages: [lastMessage]
+  messages: lastAnnotated ? [lastAnnotated] : []
   };
 }
 
@@ -522,13 +599,20 @@ async function catalogNode(state: typeof SupervisorState.State) {
   
   console.log('[catalogNode] Processing with catalog agent for user:', userId, 'conversation:', conversationId);
   
-  const lastMessage = messages[messages.length - 1];
-  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
-  
-  const result = await callLangGraphAgent({ agentId: 'catalog', message: messageContent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
-  
+  const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
+  const messageContent = lastAnnotated && lastAnnotated.message
+    ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
+    : '';
+
+  // Build compact context for the catalog agent and send reduced history
+  const catalogContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'catalog', messageContent);
+  const result = await callLangGraphAgent({ agentId: 'catalog', message: catalogContext, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
+
+  // Annotate returned messages as coming from the catalog assistant
+  const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'catalog'));
+
   return {
-    messages: result.messages,
+    messages: annotatedResponses,
     // PRESERVE ALL STATE - critical for workflow continuity
     userId,
     conversationId,
@@ -549,12 +633,14 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
   console.log('[cartAndCheckoutNode] Deal data:', dealData);
   console.log('[cartAndCheckoutNode] Pending product:', pendingProduct);
   console.log('[cartAndCheckoutNode] Cart data:', cartData);
-  console.log('[cartAndCheckoutNode] All messages:', messages.map(m => ({ role: m instanceof HumanMessage ? 'human' : 'ai', content: typeof m.content === 'string' ? m.content : m.content.toString().substring(0, 100) })));
+  console.log('[cartAndCheckoutNode] All messages:', messages.map(m => ({ role: m.role, content: typeof m.message.content === 'string' ? m.message.content : String(m.message.content).substring(0, 100) })));
   
   // Determine the message to send to the cart agent
   let messageToAgent: string;
-  const lastMessage = messages[messages.length - 1];
-  const originalContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
+  const originalContent = lastAnnotated && lastAnnotated.message
+    ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
+    : '';
   
   // Check if this is a checkout request
   const isCheckoutRequest = originalContent.toLowerCase().includes('checkout') || 
@@ -593,11 +679,16 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     messageToAgent = `[userId:${userId}] ${originalContent}`;
   }
   
-  const result = await callLangGraphAgent({ agentId: 'cart_and_checkout', message: messageToAgent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
+  // Build compact context for cart agent and prepend detailed action instructions
+  const cartContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'cart_and_checkout', originalContent);
+  const fullCartMessage = `${cartContext}\n\n${messageToAgent}`;
+  const result = await callLangGraphAgent({ agentId: 'cart_and_checkout', message: fullCartMessage, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
+
+  const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'cart_and_checkout'));
   
   // Check if the cart operation failed and suggest alternative
   const resultMessage = result.messages && result.messages.length > 0 ? result.messages[result.messages.length - 1] : null;
-  const responseContent = typeof resultMessage?.content === 'string' ? resultMessage.content : (result.content || '');
+  const responseContent = resultMessage && resultMessage.content ? (typeof resultMessage.content === 'string' ? resultMessage.content : '') : (result.content || '');
   
   // Detect if product was not recognized
   const contentStr = typeof responseContent === 'string' ? responseContent : '';
@@ -612,7 +703,7 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     const helpfulMessage = new AIMessage(`I couldn't find "${pendingProduct.product}" in our catalog. Let me help you find the right product. You can try searching for similar items or browse our catalog.`);
     
     return {
-      messages: result.messages ? [...result.messages, helpfulMessage] : [helpfulMessage],
+      messages: annotatedResponses ? [...annotatedResponses, annotateMessage(helpfulMessage, 'assistant', 'cart_and_checkout')] : [annotateMessage(helpfulMessage, 'assistant', 'cart_and_checkout')],
       userId,
       conversationId,
       workflowContext: null, // Clear workflow context to allow new interactions
@@ -624,7 +715,7 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
   }
   
   return {
-    messages: result.messages,
+    messages: annotatedResponses,
     // PRESERVE ALL STATE - critical for workflow continuity
     userId,
     conversationId,
@@ -644,17 +735,20 @@ async function dealsNode(state: typeof SupervisorState.State) {
   console.log('[dealsNode] Pending product:', pendingProduct);
   
   // Determine message to send to deals agent
-  const lastMessage = messages[messages.length - 1];
-  let messageToAgent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
+  let messageToAgent = lastAnnotated && lastAnnotated.message
+    ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
+    : '';
   
   if (pendingProduct && workflowContext === 'check_deals') {
     messageToAgent = `User wants to add to cart: "${messageToAgent}". Check for deals on ${pendingProduct.product}${pendingProduct.quantity ? ` (quantity: ${pendingProduct.quantity})` : ''}`;
   }
   
-  const result = await callLangGraphAgent({ agentId: 'deals', message: messageToAgent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
-  
+  const dealsContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'deals', messageToAgent);
+  const result = await callLangGraphAgent({ agentId: 'deals', message: dealsContext, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
+  const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'deals'));
   // Analyze response for deal confirmation needs
-  const responseMessages = result.messages;
+  const responseMessages = annotatedResponses;
   const responseContent = result.content || 'No deals found';
   
   // Simple check for deal confirmation prompts
@@ -710,13 +804,17 @@ async function paymentNode(state: typeof SupervisorState.State) {
   console.log('[paymentNode] Processing with payment agent for user:', userId, 'conversation:', conversationId);
   console.log('[paymentNode] Workflow context:', workflowContext);
   
-  const lastMessage = messages[messages.length - 1];
-  const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
+  const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
+  const messageContent = lastAnnotated && lastAnnotated.message
+    ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
+    : '';
   
-  const result = await callLangGraphAgent({ agentId: 'payment', message: messageContent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
+  const paymentContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'payment', messageContent);
+  const result = await callLangGraphAgent({ agentId: 'payment', message: paymentContext, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
+  const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'payment'));
   
   return {
-    messages: result.messages,
+    messages: annotatedResponses,
     // PRESERVE ALL STATE
     userId,
     conversationId,
@@ -772,8 +870,9 @@ export class SupervisorAgent {
     this.userId = userId;
     this.conversationId = conversationId;
     this.memorySaver = new MemorySaver();
-    this.threadPrefix = `supervisor-${userId}`;
-    this.lgClient = new LangGraphClient(LANGGRAPH_SERVER_URL);
+  this.threadPrefix = `supervisor-${userId}`;
+  // Reuse the module-level global LangGraphClient to avoid creating multiple connections
+  this.lgClient = globalLangGraphClient;
     
     // Create compiled graph with optimized configuration
     this.compiledGraph = workflow.compile({ 
@@ -813,8 +912,11 @@ export class SupervisorAgent {
       // Ensure remote thread exists so LangGraph streaming and memory map work consistently
       await this.lgClient.ensureThread(effectiveConversationId, this.userId);
 
+      // Annotate incoming user message so graph state uses AnnotatedMessage consistently
+      const annotatedInput = annotateMessage(new HumanMessage(message), 'user');
+
       const result = await this.compiledGraph.invoke({
-        messages: [new HumanMessage(message)],
+        messages: [annotatedInput],
         userId: this.userId,
         conversationId: effectiveConversationId,
         next: '',
@@ -853,8 +955,10 @@ export class SupervisorAgent {
       await this.lgClient.ensureThread(effectiveConversationId, this.userId);
       conversationThreadTimestamps.set(effectiveConversationId, Date.now());
 
+      const annotatedInput = annotateMessage(new HumanMessage(message), 'user');
+
       return this.compiledGraph.stream({
-        messages: [new HumanMessage(message)],
+        messages: [annotatedInput],
         userId: this.userId,
         conversationId: effectiveConversationId,
         next: '',
@@ -890,8 +994,17 @@ export class SupervisorAgent {
     await this.lgClient.ensureThread(effectiveConversationId, this.userId);
     conversationThreadTimestamps.set(effectiveConversationId, Date.now());
 
+    // Ensure incoming messages are annotated (if plain HumanMessage, wrap them)
+    const annotatedMessages = input.messages.map(m => {
+      if ((m as AnnotatedMessage).message) return m as AnnotatedMessage;
+      // assume m is a HumanMessage/SystemMessage/AIMessage
+      if (m instanceof HumanMessage) return annotateMessage(m, 'user');
+      if (m instanceof SystemMessage) return annotateMessage(m, 'system');
+      return annotateMessage(m as AIMessage, 'assistant');
+    });
+
     return await this.compiledGraph.invoke({
-      messages: input.messages,
+      messages: annotatedMessages,
       userId: this.userId,
       conversationId: effectiveConversationId,
       next: '',

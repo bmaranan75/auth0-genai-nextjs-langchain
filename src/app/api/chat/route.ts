@@ -63,15 +63,43 @@ export async function POST(req: NextRequest) {
       
       console.log("[chat-api] Agent result:", JSON.stringify(result, null, 2));
       
-      // Extract the response from the agent
-      const responseMessage = result.messages[result.messages.length - 1];
-      console.log("[chat-api] Response message:", responseMessage.content);
+      // Extract the response from the agent. Support nested AnnotatedMessage wrappers and plain AIMessage.
+      const rawResponse = result.messages && result.messages.length > 0 ? result.messages[result.messages.length - 1] : null;
+
+      // Helper to recursively unwrap objects with a `.message` property until we reach the underlying message
+      function unwrapMessage(obj: any): any {
+        let cur = obj;
+        const seen = new Set<any>();
+        while (cur && typeof cur === 'object' && 'message' in cur && !seen.has(cur)) {
+          seen.add(cur);
+          cur = cur.message;
+        }
+        return cur;
+      }
+
+      const unwrapped = rawResponse ? unwrapMessage(rawResponse) : null;
+      // Try common fields for content
+      let responseContent: string | undefined = undefined;
+      if (unwrapped) {
+        if (typeof unwrapped === 'string') responseContent = unwrapped;
+        else if (unwrapped.content) responseContent = typeof unwrapped.content === 'string' ? unwrapped.content : String(unwrapped.content);
+        else if (unwrapped.text) responseContent = typeof unwrapped.text === 'string' ? unwrapped.text : String(unwrapped.text);
+      }
+
+      // Fallback: sometimes agent returns top-level `content` or `result.content`
+      if (!responseContent && result && (result.content || result.result?.content)) {
+        const fallback = result.content || result.result?.content;
+        responseContent = typeof fallback === 'string' ? fallback : String(fallback);
+      }
+
+      console.log("[chat-api] Raw agent response:", JSON.stringify(rawResponse || result, null, 2));
+      console.log("[chat-api] Unwrapped response content:", responseContent);
       
       // Get authorization state after processing
       const authState = getAuthorizationState();
       
       const response: any = {
-        message: responseMessage.content || "I'm sorry, I couldn't process that request."
+        message: responseContent || "I'm sorry, I couldn't process that request."
       };
 
       // Include authorization status if there was an authorization request
