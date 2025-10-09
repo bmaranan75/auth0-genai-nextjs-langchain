@@ -4,8 +4,9 @@ import { MemorySaver } from '@langchain/langgraph';
 import { z } from 'zod';
 import { addToCartTool } from '../tools/add-to-cart-langchain-structured';
 import { getCartTool } from '../tools/get-user-cart-langchain';
-import { createCheckoutCartTool } from '../tools/checkout-langchain-refactored';
+import { createCheckoutCartTool, authorizedTracedCheckoutCartTool } from '../tools/checkout-langchain-refactored';
 import { addPaymentMethodToolLangChain } from '../tools/add-payment-method-langchain';
+import { withAsyncAuthorization } from '../auth0-ai-langchain';
 
 const date = new Date().toISOString();
 
@@ -77,10 +78,11 @@ PARSING RESULT: {"productCode": "apple", "quantity": 2, "userId": "google-oauth2
    - Triggers push notifications for user authorization
    - Processes payment and completes order placement
    - **CRITICAL WORKFLOW**: 
-     1. If user says "checkout" or "buy" and cart data is provided in message, use checkout_cart tool with that data
-     2. If user says "checkout" but no cart data provided, first use get_cart tool, then use checkout_cart tool
+     1. If user says "checkout" or "buy" and cart data is provided in message, use checkout_cart tool with {"cartData": cart_data}
+     2. If user says "checkout" but no cart data provided, first use get_cart tool, then use checkout_cart tool with {"cartData": returned_cart_data}
      3. NEVER use get_cart multiple times in same conversation turn
      4. NEVER get stuck in loops - if you've called get_cart once, proceed with checkout
+   - **PARAMETER FORMAT**: Always call checkout_cart with {"cartData": {cart_object}} where cart_object contains user info and items
 
 4. **Add Payment Method** (Requires Authentication) - For payment setup:
    - Add new payment methods to user accounts
@@ -183,8 +185,8 @@ export class CartAndCheckoutAgent {
       addToCartTool(userId),
       getCartTool(userId),
       addPaymentMethodToolLangChain,
-      // Always include the checkout tool - it can handle cart data from parameters
-      checkoutCartTool,
+      // CRITICAL FIX: Use Auth0 wrapped tool that expects cart data as parameter
+      authorizedTracedCheckoutCartTool,
     ];
 
     this.agent = createReactAgent({
@@ -241,9 +243,6 @@ export const createCartAndCheckoutAgent = (userId: string, cartData?: any) => {
   return new CartAndCheckoutAgent(userId, cartData);
 };
 
-// Import checkout tools
-import { checkoutCartTool } from '../tools/checkout-langchain-refactored';
-
 // The fundamental issue is that LangGraph server tools can't be dynamic per request
 // We need to modify the tools to handle user context properly
 // For now, let's create server tools with better error handling
@@ -253,8 +252,8 @@ const serverTools = [
   addToCartTool('default-user'), // TODO: Make this dynamic based on request context
   getCartTool('default-user'),   // TODO: Make this dynamic based on request context  
   addPaymentMethodToolLangChain,
-  // Add the standard checkout tool that expects cart data as parameter
-  checkoutCartTool,
+  // CRITICAL: Use pre-authorized tool for CIBA push notifications
+  authorizedTracedCheckoutCartTool,
 ];
 
 export const cartAndCheckoutGraph = createReactAgent({

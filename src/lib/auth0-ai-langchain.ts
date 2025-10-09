@@ -40,8 +40,31 @@ export const resetAuthorizationState = () => {
 
 // CIBA flow for user confirmation
 export const withAsyncAuthorization = auth0AI.withAsyncUserConfirmation({
-  userID: async (_params, config) => {
-    return config?.configurable?._credentials?.user?.sub;
+  userID: async (params, config) => {
+    // Try multiple paths to get user ID
+    let userId = config?.configurable?._credentials?.user?.sub;
+    
+    if (!userId && params?.cartData?.userId) {
+      // Extract user ID from cart data if available
+      userId = params.cartData.userId;
+      console.log(`[Auth0] Extracted user ID from cartData: ${userId}`);
+    }
+    
+    if (!userId && params?.userId) {
+      // Extract user ID from parameters if available
+      userId = params.userId;
+      console.log(`[Auth0] Extracted user ID from params: ${userId}`);
+    }
+    
+    if (!userId) {
+      console.error('[Auth0] No user ID found in config or params:', { 
+        configPath: config?.configurable?._credentials?.user?.sub,
+        cartDataUserId: params?.cartData?.userId,
+        paramsUserId: params?.userId 
+      });
+    }
+    
+    return userId;
   },
   bindingMessage: async (params) => {
     let message: string;

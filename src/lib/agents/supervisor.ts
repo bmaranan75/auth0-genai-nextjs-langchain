@@ -250,6 +250,15 @@ async function callLangGraphAgent(
         userId,
         conversationId
       },
+      config: {
+        configurable: {
+          _credentials: {
+            user: {
+              sub: userId
+            }
+          }
+        }
+      },
       assistant_id: agentId,
       // Add streaming configuration
       stream_mode: "values"

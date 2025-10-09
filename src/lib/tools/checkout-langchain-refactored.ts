@@ -2,6 +2,7 @@ import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { getCIBACredentials } from '@auth0/ai-langchain';
 import { withTracing } from '../tracing';
+import { withAsyncAuthorization } from '../auth0-ai-langchain';
 
 // Import authorization state management
 let authorizationState: { status: string; message?: string } | null = null;
@@ -22,7 +23,7 @@ let dynamicCheckoutToolRunning = false;
 
 // Create a dynamic checkout tool that gets cart data from configuration
 export const createCheckoutCartTool = (cartData: any) => tool(
-  async ({}) => {
+  async ({ cartData: paramCartData }) => {
     if (dynamicCheckoutToolRunning) {
       console.warn('[createCheckoutCartTool] Tool already running, preventing recursion');
       throw new Error('Cart checkout is already in progress. Please wait for the current operation to complete.');
@@ -39,8 +40,8 @@ export const createCheckoutCartTool = (cartData: any) => tool(
         'Content-Type': 'application/json',
       };
       
-      // Use cart data provided during tool creation
-      const processedCartData = cartData || {};
+      // Use cart data provided during tool creation or from parameters
+      const processedCartData = paramCartData || cartData || {};
 
       const body = {
         action: 'checkout_cart',
@@ -94,7 +95,7 @@ export const createCheckoutCartTool = (cartData: any) => tool(
     name: 'checkout_cart',
     description: 'Tool to checkout the entire shopping cart. Use this tool when the user wants to purchase, buy, checkout, or complete their order for all items in their cart. This tool requires user authorization and will trigger the CIBA authentication flow. Cart data is automatically provided from the supervisor.',
     schema: z.object({
-      // No parameters needed - cart data comes from tool creation
+      cartData: z.any().optional().describe('Cart data for checkout - will use provided cart data if not specified'),
     }),
   },
 );
@@ -395,3 +396,9 @@ const recursionSafeCheckoutCartTool = tool(
 // Export tools with tracing enabled and recursion prevention
 export const tracedCheckoutTool = withTracing(recursionSafeCheckoutTool, 'checkout-product');
 export const tracedCheckoutCartTool = withTracing(recursionSafeCheckoutCartTool, 'checkout-cart');
+
+// Export Auth0 wrapped tools for CIBA push notifications
+export const authorizedCheckoutTool = withAsyncAuthorization(recursionSafeCheckoutTool);
+export const authorizedCheckoutCartTool = withAsyncAuthorization(checkoutCartTool);
+export const authorizedTracedCheckoutTool = withTracing(withAsyncAuthorization(recursionSafeCheckoutTool), 'checkout-product');
+export const authorizedTracedCheckoutCartTool = withTracing(withAsyncAuthorization(checkoutCartTool), 'checkout-cart');
