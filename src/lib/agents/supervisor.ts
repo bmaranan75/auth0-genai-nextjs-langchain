@@ -163,8 +163,7 @@ const llm = new ChatOpenAI({
 // LangGraph server configuration
 const LANGGRAPH_SERVER_URL = 'http://localhost:2024';
 
-// Thread ID mapping to maintain conversation continuity across agent calls
-const conversationThreadMap = new Map<string, string>();
+import LangGraphClient, { conversationThreadMap, conversationThreadTimestamps, AgentCallOptions, AgentCallResult } from './langgraphClient';
 
 // Clean up old conversation mappings (prevent memory leaks)
 setInterval(() => {
@@ -177,255 +176,13 @@ setInterval(() => {
 }, 60 * 60 * 1000); // 1 hour
 
 // Enhanced helper function to call LangGraph services via HTTP with retry logic
-async function callLangGraphAgent(
-  agentId: string, 
-  message: string, 
-  userId: string, 
-  conversationId: string,
-  retryCount: number = 0
-): Promise<{ messages: any[], content?: string }> {
-  const MAX_RETRIES = 3;
-  const RETRY_DELAY = 1000;
-  
-  try {
-    console.log(`[callLangGraphAgent] Calling ${agentId} (attempt ${retryCount + 1}) with message:`, message.substring(0, 100) + '...');
-    
-    // CRITICAL FIX: Use conversation-based thread mapping for memory persistence
-    // This ensures all agents in the same conversation share context
-    let threadId = conversationThreadMap.get(conversationId);
-    
-    console.log(`[callLangGraphAgent] Agent: ${agentId}, UserId: ${userId}, ConversationId: ${conversationId}`);
-    
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
-    
-    if (!threadId) {
-      // Create new thread for this conversation
-      console.log(`[callLangGraphAgent] Creating new thread for conversation: ${conversationId}`);
-      
-      const threadResponse = await fetch(`${LANGGRAPH_SERVER_URL}/threads`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          metadata: {
-            conversationId,
-            userId,
-            agentId,
-            createdAt: new Date().toISOString()
-          }
-        }),
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!threadResponse.ok) {
-        throw new Error(`Failed to create thread for conversation ${conversationId}: ${threadResponse.status} - ${threadResponse.statusText}`);
-      }
-      
-      const threadData = await threadResponse.json();
-      threadId = threadData.thread_id;
-      
-      if (threadId) {
-        // Map this conversation to the thread ID
-        conversationThreadMap.set(conversationId, threadId);
-        console.log(`[callLangGraphAgent] Created and mapped thread ${threadId} for conversation: ${conversationId}`);
-      } else {
-        throw new Error(`No thread_id returned when creating thread for conversation: ${conversationId}`);
-      }
-    } else {
-      console.log(`[callLangGraphAgent] Reusing existing thread ${threadId} for conversation: ${conversationId}`);
-    }
-    
-    // Enhanced message data with better structure
-    const messageData = {
-      input: {
-        messages: [
-          {
-            role: 'human',
-            content: message
-          }
-        ],
-        // Pass context to specialized agents
-        userId,
-        conversationId
-      },
-      config: {
-        configurable: {
-          _credentials: {
-            user: {
-              sub: userId
-            }
-          }
-        }
-      },
-      assistant_id: agentId,
-      // Add streaming configuration
-      stream_mode: "values"
-    };
-    
-    const response = await fetch(`${LANGGRAPH_SERVER_URL}/threads/${threadId}/runs/stream`, {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream'
-      },
-      body: JSON.stringify(messageData)
-    });
-    
-    if (!response.ok) {
-      throw new Error(`Agent ${agentId} call failed: ${response.status} - ${response.statusText}`);
-    }
-    
-    // IMPROVED: Better streaming response processing with multi-line JSON support
-    const reader = response.body?.getReader();
-    const decoder = new TextDecoder();
-    let fullContent = '';
-    let messages: any[] = [];
-    let buffer = '';
-    let jsonBuffer = '';
-    
-    if (reader) {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete line in buffer
-        
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          
-          if (trimmedLine.startsWith('data: ')) {
-            // Add this line's JSON data to the buffer
-            jsonBuffer += trimmedLine.slice(6); // Remove 'data: ' prefix
-          } else if (trimmedLine === '' || trimmedLine.startsWith('id:') || trimmedLine.startsWith('event:')) {
-            // End of data block or start of new event, try to parse accumulated JSON
-            if (jsonBuffer.trim()) {
-              try {
-                const data = JSON.parse(jsonBuffer);
-                
-                // Handle different data structures from LangGraph
-                if (data.messages && Array.isArray(data.messages)) {
-                  // Update messages array with latest data
-                  messages = data.messages;
-                  console.log(`[callLangGraphAgent] Processing ${data.messages.length} messages from SSE data`);
-                  
-                  // Extract content from AI messages, prioritizing the last one
-                  for (let i = data.messages.length - 1; i >= 0; i--) {
-                    const msg = data.messages[i];
-                    console.log(`[callLangGraphAgent] Checking message ${i}: type=${msg?.type}, hasContent=${!!msg?.content}, contentType=${typeof msg?.content}`);
-                    
-                    if (msg && msg.type === 'ai' && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
-                      fullContent = msg.content;
-                      console.log(`[callLangGraphAgent] Found AI content: "${msg.content.substring(0, 50)}..."`);
-                      break;
-                    }
-                  }
-                } else if (data.event === 'messages/partial') {
-                  // Partial message update - continue processing
-                  continue;
-                } else if (data.event === 'messages/complete') {
-                  // Complete message event - legacy format support
-                  console.log(`[callLangGraphAgent] Processing messages/complete event`);
-                  if (data.messages && data.messages.length > 0) {
-                    messages = data.messages;
-                    
-                    // Find the last AI message with content
-                    for (let i = data.messages.length - 1; i >= 0; i--) {
-                      const msg = data.messages[i];
-                      if (msg && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
-                        fullContent = msg.content;
-                        console.log(`[callLangGraphAgent] Found content in complete event: "${msg.content.substring(0, 50)}..."`);
-                        break;
-                      }
-                    }
-                  }
-                }
-                // Skip other data types like run_id, attempt, etc.
-              } catch (e) {
-                // Only log if we have substantial content (not just whitespace or single chars)
-                if (jsonBuffer.length > 5) {
-                  console.warn(`[callLangGraphAgent] Failed to parse SSE JSON:`, jsonBuffer.substring(0, 200));
-                }
-              }
-              
-              jsonBuffer = '';
-            }
-          }
-        }
-      }
-      
-      // Process any remaining JSON buffer at the end
-      if (jsonBuffer.trim()) {
-        console.log(`[callLangGraphAgent] Processing final JSON buffer of length ${jsonBuffer.length}`);
-        try {
-          const data = JSON.parse(jsonBuffer);
-          
-          if (data.messages && Array.isArray(data.messages)) {
-            messages = data.messages;
-            console.log(`[callLangGraphAgent] Final buffer: processing ${data.messages.length} messages`);
-            
-            for (let i = data.messages.length - 1; i >= 0; i--) {
-              const msg = data.messages[i];
-              if (msg && msg.type === 'ai' && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
-                fullContent = msg.content;
-                console.log(`[callLangGraphAgent] Final buffer: found AI content: "${msg.content.substring(0, 50)}..."`);
-                break;
-              }
-            }
-          }
-        } catch (e) {
-          if (jsonBuffer.length > 5) {
-            console.warn(`[callLangGraphAgent] Failed to parse final JSON buffer:`, jsonBuffer.substring(0, 200));
-          }
-        }
-      }
-    }
-    
-    console.log(`[callLangGraphAgent] ${agentId} responded with:`, fullContent.substring(0, 200) + '...');
-    
-    // Validate response - if we have messages but no fullContent, try to extract it
-    if (!fullContent && messages.length > 0) {
-      // Try to find AI content in messages as fallback
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        if (msg && (msg.type === 'ai' || msg.role === 'assistant') && msg.content && typeof msg.content === 'string' && msg.content.trim()) {
-          fullContent = msg.content;
-          break;
-        }
-      }
-    }
-    
-    // Final validation
-    if (!fullContent && messages.length === 0) {
-      throw new Error(`No valid response from ${agentId}`);
-    }
-    
-    return {
-      messages: messages.length > 0 ? messages : [{ role: 'assistant', content: fullContent }],
-      content: fullContent || 'Agent response processed'
-    };
-    
-  } catch (error) {
-    console.error(`[callLangGraphAgent] Error calling ${agentId} (attempt ${retryCount + 1}):`, error);
-    
-    // Retry logic for transient failures
-    if (retryCount < MAX_RETRIES && (error instanceof TypeError || (error instanceof Error && error.message.includes('timeout')))) {
-      console.log(`[callLangGraphAgent] Retrying ${agentId} in ${RETRY_DELAY}ms...`);
-      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (retryCount + 1)));
-      return callLangGraphAgent(agentId, message, userId, conversationId, retryCount + 1);
-    }
-    
-    // Return graceful error response
-    const errorMessage = `I apologize, but I'm having trouble connecting to the ${agentId} service right now. Please try again in a moment.`;
-    return {
-      messages: [{ role: 'assistant', content: errorMessage }],
-      content: errorMessage
-    };
-  }
+async function callLangGraphAgent(opts: AgentCallOptions): Promise<AgentCallResult> {
+  // Delegate to LangGraphClient
+  const client = new LangGraphClient(LANGGRAPH_SERVER_URL);
+  return client.callAgentWithStream(opts);
 }
+
+// LangGraphClient implementation was extracted to src/lib/agents/langgraphClient.ts
 
 // Enhanced product information extraction using LLM
 async function extractProductInfo(content: string): Promise<{ product: string; quantity?: number } | null> {
@@ -768,7 +525,7 @@ async function catalogNode(state: typeof SupervisorState.State) {
   const lastMessage = messages[messages.length - 1];
   const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
   
-  const result = await callLangGraphAgent('catalog', messageContent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
+  const result = await callLangGraphAgent({ agentId: 'catalog', message: messageContent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
   
   return {
     messages: result.messages,
@@ -836,7 +593,7 @@ async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     messageToAgent = `[userId:${userId}] ${originalContent}`;
   }
   
-  const result = await callLangGraphAgent('cart_and_checkout', messageToAgent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
+  const result = await callLangGraphAgent({ agentId: 'cart_and_checkout', message: messageToAgent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
   
   // Check if the cart operation failed and suggest alternative
   const resultMessage = result.messages && result.messages.length > 0 ? result.messages[result.messages.length - 1] : null;
@@ -894,7 +651,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
     messageToAgent = `User wants to add to cart: "${messageToAgent}". Check for deals on ${pendingProduct.product}${pendingProduct.quantity ? ` (quantity: ${pendingProduct.quantity})` : ''}`;
   }
   
-  const result = await callLangGraphAgent('deals', messageToAgent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
+  const result = await callLangGraphAgent({ agentId: 'deals', message: messageToAgent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
   
   // Analyze response for deal confirmation needs
   const responseMessages = result.messages;
@@ -956,7 +713,7 @@ async function paymentNode(state: typeof SupervisorState.State) {
   const lastMessage = messages[messages.length - 1];
   const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : lastMessage.content.toString();
   
-  const result = await callLangGraphAgent('payment', messageContent, userId || 'default-user', conversationId || `conv-${userId || 'default'}-session`);
+  const result = await callLangGraphAgent({ agentId: 'payment', message: messageContent, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
   
   return {
     messages: result.messages,
@@ -1009,12 +766,14 @@ export class SupervisorAgent {
   private memorySaver: MemorySaver;
   private compiledGraph: any;
   private threadPrefix: string;
+  private lgClient: LangGraphClient;
 
   constructor(userId: string, conversationId?: string) {
     this.userId = userId;
     this.conversationId = conversationId;
     this.memorySaver = new MemorySaver();
     this.threadPrefix = `supervisor-${userId}`;
+    this.lgClient = new LangGraphClient(LANGGRAPH_SERVER_URL);
     
     // Create compiled graph with optimized configuration
     this.compiledGraph = workflow.compile({ 
@@ -1045,12 +804,15 @@ export class SupervisorAgent {
   // OPTIMIZED: Improved chat method with better state handling
   async chat(message: string, conversationId?: string): Promise<any> {
     const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
-    const threadId = this.getThreadId(conversationId);
-    
+    const threadId = this.getThreadId(effectiveConversationId);
+
     console.log('[SupervisorAgent] Processing message with thread ID:', threadId);
     console.log('[SupervisorAgent] Effective conversation ID:', effectiveConversationId);
-    
+
     try {
+      // Ensure remote thread exists so LangGraph streaming and memory map work consistently
+      await this.lgClient.ensureThread(effectiveConversationId, this.userId);
+
       const result = await this.compiledGraph.invoke({
         messages: [new HumanMessage(message)],
         userId: this.userId,
@@ -1064,11 +826,14 @@ export class SupervisorAgent {
           max_execution_time: 60000 // 60 seconds
         }
       });
-      
+
+      // update timestamp for mapping
+      conversationThreadTimestamps.set(effectiveConversationId, Date.now());
+
       return result;
     } catch (error) {
       console.error('[SupervisorAgent] Error in chat:', error);
-      
+
       // Return graceful error response
       return {
         messages: [new AIMessage('I apologize, but I encountered an error processing your request. Please try again.')],
@@ -1081,11 +846,13 @@ export class SupervisorAgent {
 
   // Enhanced stream support with better error handling
   async stream(message: string, conversationId?: string) {
-    const threadId = this.getThreadId(conversationId);
-    
+    const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
+    const threadId = this.getThreadId(effectiveConversationId);
+
     try {
-      const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
-      
+      await this.lgClient.ensureThread(effectiveConversationId, this.userId);
+      conversationThreadTimestamps.set(effectiveConversationId, Date.now());
+
       return this.compiledGraph.stream({
         messages: [new HumanMessage(message)],
         userId: this.userId,
@@ -1120,7 +887,9 @@ export class SupervisorAgent {
     finalConfig.configurable.max_execution_time = finalConfig.configurable.max_execution_time || 60000;
     
     const effectiveConversationId = input.conversationId || this.conversationId || `conv-${this.userId}-session`;
-    
+    await this.lgClient.ensureThread(effectiveConversationId, this.userId);
+    conversationThreadTimestamps.set(effectiveConversationId, Date.now());
+
     return await this.compiledGraph.invoke({
       messages: input.messages,
       userId: this.userId,
@@ -1131,8 +900,12 @@ export class SupervisorAgent {
 
   // NEW: Method to get current state/context
   async getCurrentState(conversationId?: string): Promise<any> {
-    const threadId = this.getThreadId(conversationId);
+    const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
+    const threadId = this.getThreadId(effectiveConversationId);
     try {
+      // Ensure thread exists remotely
+      await this.lgClient.ensureThread(effectiveConversationId, this.userId);
+      conversationThreadTimestamps.set(effectiveConversationId, Date.now());
       return await this.memorySaver.get({ configurable: { thread_id: threadId } });
     } catch (error) {
       console.error('[SupervisorAgent] Error getting current state:', error);
@@ -1142,11 +915,16 @@ export class SupervisorAgent {
 
   // ENHANCED: Better session clearing
   async clearSession(conversationId?: string): Promise<void> {
-    const threadId = this.getThreadId(conversationId);
+    const effectiveConversationId = conversationId || this.conversationId || `conv-${this.userId}-session`;
+    const threadId = this.getThreadId(effectiveConversationId);
     try {
-      // MemorySaver doesn't have a delete method, so we'll create a new instance
+      // Remove from local maps
+      conversationThreadMap.delete(effectiveConversationId);
+      conversationThreadTimestamps.delete(effectiveConversationId);
+
+      // Reset memory saver for this agent instance
       this.memorySaver = new MemorySaver();
-      console.log('[SupervisorAgent] Cleared session for thread:', threadId);
+      console.log('[SupervisorAgent] Cleared session for conversation:', effectiveConversationId, 'thread:', threadId);
     } catch (error) {
       console.error('[SupervisorAgent] Error clearing session:', error);
     }
@@ -1155,10 +933,14 @@ export class SupervisorAgent {
   // NEW: Get all active sessions for this user
   async getActiveSessions(): Promise<string[]> {
     try {
-      // Note: MemorySaver doesn't have a direct method to list all threads
-      // This would need to be implemented based on your specific storage backend
-      console.log('[SupervisorAgent] Active sessions would be listed here');
-      return [];
+      // Return active conversation IDs for this user from the in-memory map
+      const active: string[] = [];
+      for (const [convId, threadId] of conversationThreadMap.entries()) {
+        if (convId.includes(this.userId) || convId.includes(`conv-${this.userId}`) || threadId?.includes(this.userId)) {
+          active.push(convId);
+        }
+      }
+      return active;
     } catch (error) {
       console.error('[SupervisorAgent] Error getting active sessions:', error);
       return [];

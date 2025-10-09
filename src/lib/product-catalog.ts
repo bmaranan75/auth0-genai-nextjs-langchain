@@ -44,7 +44,7 @@ export function findProduct(identifier: string): Product | null {
   const searchTerm = identifier.toLowerCase().trim();
   console.log(`[product-catalog] Finding product with identifier: ${searchTerm}`);
   // First try to find by exact code match
-  let product = PRODUCT_CATALOG.find(p => p.code.toLowerCase() === searchTerm);
+  let product = PRODUCT_CATALOG.find(p => p.id.toLowerCase() === searchTerm);
   
   // If not found by code, try to find by name (partial match)
   // if (!product) {

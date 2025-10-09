@@ -26,7 +26,7 @@ export const addToCartTool = (defaultUserId: string = 'default-user') => new Dyn
     quantity: z.number().default(1).describe('Quantity to add (default: 1)'),
     userId: z.string().describe('User ID extracted from message [userId:USER_ID] format')
   }),
-  func: async (input: { productCode: string; quantity: number; userId: string }) => {
+  func: async (inputString: any) => {
     const startTime = Date.now();
     
     try {
@@ -65,11 +65,11 @@ export const addToCartTool = (defaultUserId: string = 'default-user') => new Dyn
       
       // Use robust parser for input handling
       const parseResult = parseCartInput(inputString);
-      
+
       if (!parseResult.success) {
         return formatToolResponse(false, null, parseResult.error);
       }
-      
+
       let input = parseResult.data;
       
       // Extract userId from input or context message (check for [userId:USER_ID] format)
