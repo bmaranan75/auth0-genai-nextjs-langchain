@@ -24,7 +24,9 @@
 import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
 import { MemorySaver } from '@langchain/langgraph';
 import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages';
+import { HumanMessage, SystemMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
+import { planner } from './planner';
+import { ToolNode } from '@langchain/langgraph/prebuilt';
 
 // Annotated message wrapper so we know which agent produced/handled each message
 type AgentRole = 'user' | 'assistant' | 'system';
@@ -34,9 +36,56 @@ interface AnnotatedMessage {
   agent?: string;        // e.g. 'catalog', 'cart_and_checkout', 'deals', 'payment'
   senderId?: string;     // optional identifier of agent or external source
   timestamp: number;
+  delegation?: {         // delegation information from planner
+    targetAgent: string;
+    task: string;
+    reasoning: string;
+  };
 }
 
-// Helper to wrap messages consistently
+const routePlanner = (state: typeof SupervisorState.State) => {
+  const { messages } = state;
+  const lastMessage = messages[messages.length - 1];
+
+  console.log("[routePlanner] Processing planner response:", JSON.stringify(lastMessage, null, 2));
+
+  // Check if this is a planner delegation
+  if (lastMessage && lastMessage.delegation) {
+    const { targetAgent } = lastMessage.delegation;
+    console.log(`[routePlanner] Routing based on planner delegation to: ${targetAgent}`);
+    
+    // Validate that the target agent exists in our graph
+    const validAgents = ["catalog", "cart_and_checkout", "deals", "payment", "notification_agent", "supervisor"];
+    if (validAgents.includes(targetAgent)) {
+      return targetAgent;
+    } else {
+      console.warn(`[routePlanner] Invalid target agent: ${targetAgent}, falling back to supervisor`);
+      return "supervisor";
+    }
+  }
+
+  // Check for tool calls in the message
+  if (!lastMessage || !("message" in lastMessage) || !("tool_calls" in lastMessage.message) || !lastMessage.message.tool_calls || lastMessage.message.tool_calls.length === 0) {
+    return END;
+  }
+
+  const toolName = lastMessage.message.tool_calls[0].name;
+
+  if (toolName === "direct_response") {
+    // For direct response, we can end here since the planner already has the final answer
+    console.log("[routePlanner] Direct response - ending workflow");
+    return END;
+  }
+  if (toolName === "delegate_to_agent") {
+    // This should be handled by the delegation check above, but fallback to supervisor
+    console.log("[routePlanner] Delegation tool call detected, routing to supervisor");
+    return "supervisor";
+  }
+  if (toolName === "generate_plan") {
+    return "supervisor";
+  }
+  return END;
+};// Helper to wrap messages consistently
 export function annotateMessage(msg: HumanMessage | AIMessage | SystemMessage, role: AgentRole, agent?: string, senderId?: string): AnnotatedMessage {
   return {
     message: msg,
@@ -671,10 +720,18 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
     : '';
   
-  // Check if this is a checkout request
-  const isCheckoutRequest = originalContent.toLowerCase().includes('checkout') || 
-                           originalContent.toLowerCase().includes('buy') ||
-                           originalContent.toLowerCase().includes('purchase') ||
+  // Extract the original user message to determine if this is a checkout request
+  // Don't use planner routing messages which contain "cart_and_checkout" 
+  const userMessages = messages.filter(m => m.role === 'user');
+  const lastUserMessage = userMessages.length > 0 ? userMessages[userMessages.length - 1] : null;
+  const actualUserContent = lastUserMessage ? 
+    (typeof lastUserMessage.message.content === 'string' ? lastUserMessage.message.content : String(lastUserMessage.message.content)) 
+    : originalContent;
+  
+  // Check if this is a checkout request based on actual user intent, not planner routing
+  const isCheckoutRequest = actualUserContent.toLowerCase().includes('checkout') || 
+                           actualUserContent.toLowerCase().includes('buy') ||
+                           actualUserContent.toLowerCase().includes('purchase') ||
                            workflowContext === 'process_checkout' ||
                            workflowContext === 'prepare_checkout';
   
@@ -704,16 +761,17 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
       console.log('[cartAndCheckoutNode] Checkout message without cart data - agent will handle getting cart');
     }
   } else {
-    // For other scenarios, use the original user message with userId context
-    messageToAgent = `[userId:${userId}] ${originalContent}`;
+    // For other scenarios, use the actual user message with userId context
+    messageToAgent = `[userId:${userId}] ${actualUserContent}`;
   }
   
   // Build compact context for cart agent and prepend detailed action instructions
-  const cartContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'cart_and_checkout', originalContent);
+  const cartContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'cart_and_checkout', actualUserContent);
 
-  // Request structured JSON when performing checkout so the supervisor can reliably detect success.
-  // Instruct the cart agent: when completing a checkout return ONLY a JSON object with the following shape.
-  const structuredInstruction = `\n\nIF YOU COMPLETE A CHECKOUT, RETURN ONLY A JSON OBJECT WITH THIS SHAPE (no additional text):\n{\n  "checkoutStatus": "success" | "failure",\n  "orderId": string | null,\n  "summary": string | null,\n  "items": Array<any> | null,\n  "total": number | null\n}\nIf no checkout was performed, return your normal assistant text.`;
+  // Only add structured checkout instruction for actual checkout requests
+  const structuredInstruction = isCheckoutRequest 
+    ? `\n\nWhen completing checkout, return ONLY a JSON object with this shape (no additional text):\n{\n  "checkoutStatus": "success" | "failure",\n  "orderId": string | null,\n  "summary": string | null,\n  "items": Array<any> | null,\n  "total": number | null\n}`
+    : '';
 
   const fullCartMessage = `${cartContext}\n\n${messageToAgent}${structuredInstruction}`;
   const result = await callLangGraphAgent({ agentId: 'cart_and_checkout', message: fullCartMessage, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
@@ -894,22 +952,48 @@ async function dealsNode(state: typeof SupervisorState.State) {
       next: END,
     };
   } else {
-    // No confirmation needed, proceed to add to cart
-    return {
-      messages: responseMessages,
-      workflowContext: 'add_to_cart_with_deals',
-      dealData: { 
-        ...dealData, // Preserve existing deal data
-        applied: true, 
-        response: responseContent, 
-        type: 'product_deal' 
-      },
-      pendingProduct,
-      cartData, // Preserve cart data
-      userId,
-      conversationId,
-      next: 'cart_and_checkout',
-    };
+    // Check if this is a "no deals available" scenario
+    const noDealsAvailable = responseContent.toLowerCase().includes('no current deals') ||
+                             responseContent.toLowerCase().includes('no deals available') ||
+                             responseContent.toLowerCase().includes('expired') ||
+                             responseContent.toLowerCase().includes('unfortunately, there are no');
+    
+    if (noDealsAvailable) {
+      // No deals available - end workflow, let user decide next action
+      console.log('[dealsNode] No deals available, ending workflow to allow user choice');
+      return {
+        messages: responseMessages,
+        workflowContext: null, // Clear workflow context
+        dealData: { 
+          ...dealData,
+          applied: false, 
+          response: responseContent, 
+          type: 'no_deals_found' 
+        },
+        pendingProduct: null, // Clear pending product since deals search is complete
+        cartData,
+        userId,
+        conversationId,
+        next: END,
+      };
+    } else {
+      // No confirmation needed, proceed to add to cart
+      return {
+        messages: responseMessages,
+        workflowContext: 'add_to_cart_with_deals',
+        dealData: { 
+          ...dealData, // Preserve existing deal data
+          applied: true, 
+          response: responseContent, 
+          type: 'product_deal' 
+        },
+        pendingProduct,
+        cartData, // Preserve cart data
+        userId,
+        conversationId,
+        next: 'cart_and_checkout',
+      };
+    }
   }
 }
 
@@ -1008,21 +1092,65 @@ async function notificationAgent(state: typeof SupervisorState.State) {
   };
 }
 
+import { responseTool, planTool } from '../tools/routing';
+
 // Build the graph
+const toolNode = new ToolNode([responseTool, planTool]);
+
+// Wrapper node to adapt our AnnotatedMessage[] state to the ToolNode input
+// ToolNode expects either BaseMessage[] or { messages: BaseMessage[] } as input.
+// Our SupervisorState stores messages as AnnotatedMessage[], so convert before
+// invoking the ToolNode and then convert responses back into AnnotatedMessage.
+async function toolsNode(state: typeof SupervisorState.State) {
+  const annotated = Array.isArray(state.messages) ? state.messages : [];
+  // Extract the underlying BaseMessage objects
+  const baseMessages = annotated.map((m: any) => m && m.message).filter(Boolean);
+
+  // Invoke the ToolNode with the proper shape
+  // use { messages: baseMessages } because ToolNode accepts that form
+  const result: any = await toolNode.invoke({ messages: baseMessages }, {});
+
+  // Convert returned BaseMessages into our AnnotatedMessage wrapper
+  const annotatedResponses = (result?.messages || []).map((m: any) => {
+    // If the message is already an instance of a BaseMessage-like object, wrap it
+    return annotateMessage(m as AIMessage, 'assistant');
+  });
+
+  return {
+    messages: annotatedResponses,
+    userId: state.userId,
+    conversationId: state.conversationId,
+    next: END,
+  };
+}
+
 const workflow = new StateGraph(SupervisorState)
+  .addNode('planner', planner)
   .addNode('supervisor', supervisor)
   .addNode('catalog', catalogNode)
   .addNode('cart_and_checkout', cartAndCheckoutNode)
   .addNode('notification_agent', notificationAgent)
   .addNode('payment', paymentNode)
   .addNode('deals', dealsNode)
-  .addEdge(START, 'supervisor')
+  .addNode('tools', toolsNode)
+  .addEdge(START, 'planner')
+  .addConditionalEdges('planner', routePlanner, {
+    [END]: END,
+    supervisor: 'supervisor',
+    tools: 'tools',
+    catalog: 'catalog',
+    cart_and_checkout: 'cart_and_checkout',
+    deals: 'deals',
+    payment: 'payment',
+    notification_agent: 'notification_agent',
+  })
   .addConditionalEdges('supervisor', (state) => state.next, {
     catalog: 'catalog',
     cart_and_checkout: 'cart_and_checkout',
     payment: 'payment',
     deals: 'deals',
   })
+  .addEdge('tools', END)
   .addConditionalEdges('catalog', (state) => state.next, {
     supervisor: 'supervisor',
     [END]: END,
@@ -1128,7 +1256,7 @@ export class SupervisorAgent {
       return {
         messages: [new AIMessage('I apologize, but I encountered an error processing your request. Please try again.')],
         userId: this.userId,
-        conversationId: conversationId || this.conversationId,
+        conversationId: effectiveConversationId,
         next: END
       };
     }
@@ -1186,8 +1314,12 @@ export class SupervisorAgent {
     const annotatedMessages = input.messages.map(m => {
       if ((m as AnnotatedMessage).message) return m as AnnotatedMessage;
       // assume m is a HumanMessage/SystemMessage/AIMessage
-      if (m instanceof HumanMessage) return annotateMessage(m, 'user');
-      if (m instanceof SystemMessage) return annotateMessage(m, 'system');
+      if (m instanceof HumanMessage) {
+        return annotateMessage(m, 'user');
+      }
+      if (m instanceof SystemMessage) {
+        return annotateMessage(m, 'system');
+      }
       return annotateMessage(m as AIMessage, 'assistant');
     });
 
