@@ -202,9 +202,11 @@ export function ChatWindow(props: {
 
   // Function to check if message requires authorization
   const requiresAuthorization = (content: string): boolean => {
+    // Only treat explicit checkout/payment intents as requiring authorization.
+    // Do NOT treat generic 'add to cart' or ambiguous words like 'order' as
+    // triggers for an authorization flow.
     const authKeywords = [
-      'checkout', 'buy', 'purchase', 'order', 'shop online', 'add to cart',
-      'proceed to checkout', 'complete purchase', 'make payment'
+      'checkout', 'buy', 'purchase', 'proceed to checkout', 'complete purchase', 'make payment'
     ];
     const lowerContent = content.toLowerCase();
     return authKeywords.some(keyword => lowerContent.includes(keyword));

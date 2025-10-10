@@ -1,3 +1,4 @@
+import { describe, test, expect, vi } from 'vitest';
 import * as supervisor from '../src/lib/agents/supervisor';
 import { AIMessage } from '@langchain/core/messages';
 
@@ -9,9 +10,8 @@ describe('notificationAgent', () => {
       notificationData: { summary: 'Order placed', orderId: 'ORD-1', cartData: { items: [] } }
     };
 
-    // Mock sendPushoverNotification in the supervisor module
-    // @ts-ignore
-    supervisor.sendPushoverNotification = jest.fn().mockResolvedValue({ ok: true, result: { status: 1 } });
+  // Mock sendPushoverNotification using the exported test setter
+  supervisor.__setSendPushoverNotificationForTests(vi.fn().mockResolvedValue({ ok: true, result: { status: 1 } }));
 
     const res = await supervisor.notificationAgent(state as any);
     expect(res.next).toBe(supervisor.END);
@@ -28,8 +28,11 @@ describe('notificationAgent', () => {
       notificationData: { summary: 'Order placed', orderId: 'ORD-1', cartData: { items: [] } }
     };
 
-    // @ts-ignore
-    supervisor.sendPushoverNotification = jest.fn().mockResolvedValue({ ok: false, error: 'network' });
+  // @ts-ignore
+  supervisor.__setSendPushoverNotificationForTests(vi.fn().mockResolvedValue({ ok: false, error: 'network' }));
+
+  // reset after test
+  supervisor.__resetSendPushoverNotificationForTests();
 
     const res = await supervisor.notificationAgent(state as any);
     expect(res.next).toBe(supervisor.END);

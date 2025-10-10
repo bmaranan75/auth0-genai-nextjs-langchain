@@ -1,3 +1,4 @@
+import { describe, test, expect } from 'vitest';
 import { safeParseJson } from '../src/lib/agents/supervisor';
 
 describe('safeParseJson', () => {

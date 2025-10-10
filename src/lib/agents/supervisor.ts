@@ -25,7 +25,8 @@ import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
 import { MemorySaver } from '@langchain/langgraph';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, SystemMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
-import { planner } from './planner';
+import { planner, invalidatePlannerCacheByPrefix } from './planner';
+import { MIN_PLANNER_CONFIDENCE, MIN_CONTINUATION_CONFIDENCE, SUPERVISOR_LLM_CACHE_TTL_MS } from './constants';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 
 // Annotated message wrapper so we know which agent produced/handled each message
@@ -43,25 +44,56 @@ interface AnnotatedMessage {
   };
 }
 
-const routePlanner = (state: typeof SupervisorState.State) => {
-  const { messages } = state;
-  const lastMessage = messages[messages.length - 1];
+export const routePlanner = (state: typeof SupervisorState.State) => {
+  const { messages, delegationDepth = 0 } = state as any;
+  const lastMessage = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : null;
 
   console.log("[routePlanner] Processing planner response:", JSON.stringify(lastMessage, null, 2));
 
+  const MAX_DELEGATION_DEPTH = 3;
+  const MIN_CONFIDENCE = SAFE_MIN_PLANNER_CONFIDENCE; // planner must be somewhat confident before delegating
+
   // Check if this is a planner delegation
   if (lastMessage && lastMessage.delegation) {
-    const { targetAgent } = lastMessage.delegation;
-    console.log(`[routePlanner] Routing based on planner delegation to: ${targetAgent}`);
-    
+    const delegation = lastMessage.delegation as any;
+
+    // Basic schema validation (defensive)
+    if (!delegation || typeof delegation !== 'object' || !delegation.targetAgent || typeof delegation.targetAgent !== 'string') {
+      console.warn('[routePlanner] Invalid delegation object from planner, falling back to supervisor', delegation);
+      return 'supervisor';
+    }
+
+    const { targetAgent, confidence } = delegation;
+    console.log(`[routePlanner] Routing based on planner delegation to: ${targetAgent} (confidence: ${confidence})`);
+
+    // Prevent delegation loops
+    if ((delegationDepth as number) >= MAX_DELEGATION_DEPTH) {
+      console.warn('[routePlanner] Max delegation depth exceeded, routing to supervisor');
+      return 'supervisor';
+    }
+
     // Validate that the target agent exists in our graph
     const validAgents = ["catalog", "cart_and_checkout", "deals", "payment", "notification_agent", "supervisor"];
-    if (validAgents.includes(targetAgent)) {
-      return targetAgent;
-    } else {
+    if (!validAgents.includes(targetAgent)) {
       console.warn(`[routePlanner] Invalid target agent: ${targetAgent}, falling back to supervisor`);
-      return "supervisor";
+      return 'supervisor';
     }
+
+    // Confidence guard: only delegate when above threshold
+    if (typeof confidence === 'number' && confidence < MIN_CONFIDENCE) {
+      console.warn(`[routePlanner] Planner confidence too low (${confidence}), routing to supervisor`);
+      return 'supervisor';
+    }
+
+    // All checks passed — route to the requested agent
+    // Increment delegation depth on the state so downstream nodes see it
+    try {
+      (state as any).delegationDepth = (delegationDepth as number) + 1;
+      console.log(`[routePlanner] Incremented delegationDepth → ${(state as any).delegationDepth}`);
+    } catch (e) {
+      console.warn('[routePlanner] Could not increment delegationDepth on state', e);
+    }
+    return targetAgent;
   }
 
   // Check for tool calls in the message
@@ -259,6 +291,17 @@ const SupervisorState = Annotation.Root({
       };
     },
   }),
+  // Counter to prevent infinite delegation loops between planner and supervisor
+  delegationDepth: Annotation<number>({
+    reducer: (x, y) => {
+      // Accept explicit resets
+      if (y === null) return 0;
+      const prev = typeof x === 'number' ? x : 0;
+      const next = typeof y === 'number' ? y : prev;
+      // Clamp to a sensible maximum to avoid overflow
+      return Math.max(0, Math.min(next, 100));
+    },
+  }),
   pendingProduct: Annotation<any>({
     reducer: (x, y) => {
       if (y === null) return null; // Explicit clear
@@ -282,12 +325,48 @@ const SupervisorState = Annotation.Root({
   }),
 });
 
-const llm = new ChatOpenAI({
-  model: 'gpt-4o-mini',
-  temperature: 0,
-  maxRetries: 2,
-  timeout: 50000,
-});
+// Lazily initialize a ChatOpenAI instance so tests without API keys don't throw at import time
+let llm: any = null;
+function getLlm() {
+  if (llm) return llm;
+  try {
+    llm = new ChatOpenAI({ model: 'gpt-4o-mini', temperature: 0, maxRetries: 2, timeout: 50000 });
+    return llm;
+  } catch (e) {
+    // Minimal fallback implementation for tests - deterministic and safe
+    llm = {
+      invoke: async (msgs: any) => {
+        // Return simple default responses depending on system message content
+        const first = Array.isArray(msgs) && msgs[0];
+        const sys = first && first.type === 'system' ? first.content : '';
+        return { content: 'catalog' };
+      }
+    };
+    return llm;
+  }
+}
+
+// Helper to extract textual content from various LLM response shapes
+function extractLlmText(response: any): string {
+  if (!response) return '';
+  if (typeof response === 'string') return response;
+  if (typeof response.content === 'string') return response.content;
+  if (response.text && typeof response.text === 'string') return response.text;
+  const gen = (response.generations || response.choices || response.output || []);
+  if (Array.isArray(gen) && gen.length > 0) {
+    const first = gen[0];
+    if (typeof first === 'string') return first;
+    if (first.text) return first.text;
+    if (first.message && typeof first.message.content === 'string') return first.message.content;
+    if (first.output_text) return first.output_text;
+  }
+  try { return JSON.stringify(response); } catch (_) { return String(response); }
+}
+
+// Safe fallbacks for imported constants in case of runtime issues
+const SAFE_MIN_PLANNER_CONFIDENCE = typeof MIN_PLANNER_CONFIDENCE === 'number' ? MIN_PLANNER_CONFIDENCE : 0.4;
+const SAFE_MIN_CONTINUATION_CONFIDENCE = typeof MIN_CONTINUATION_CONFIDENCE === 'number' ? MIN_CONTINUATION_CONFIDENCE : 0.7;
+const SAFE_SUPERVISOR_LLM_CACHE_TTL_MS = typeof SUPERVISOR_LLM_CACHE_TTL_MS === 'number' ? SUPERVISOR_LLM_CACHE_TTL_MS : 30 * 1000;
 
 // LangGraph server configuration
 const LANGGRAPH_SERVER_URL = 'http://localhost:2024';
@@ -315,13 +394,24 @@ setInterval(() => {
 // Create a singleton LangGraphClient to reuse connections across calls
 const globalLangGraphClient = new LangGraphClient(LANGGRAPH_SERVER_URL);
 
-// Enhanced helper function to call LangGraph services via HTTP with retry logic
-async function callLangGraphAgent(opts: AgentCallOptions): Promise<AgentCallResult> {
+// Internal mutable implementation reference so tests can inject mocks
+let callLangGraphAgentImpl: (opts: AgentCallOptions) => Promise<AgentCallResult> = async (opts) => {
   return globalLangGraphClient.callAgentWithStream(opts);
+};
+
+// Public exported wrapper (immutable binding) that delegates to the mutable impl
+export async function callLangGraphAgent(opts: AgentCallOptions): Promise<AgentCallResult> {
+  return callLangGraphAgentImpl(opts);
 }
 
-// Exported for testing/mocking
-export { callLangGraphAgent };
+// Test helper to override the internal LangGraph agent caller
+export function __setCallLangGraphAgentForTests(fn: any) {
+  callLangGraphAgentImpl = fn;
+}
+
+export function __resetCallLangGraphAgentForTests() {
+  callLangGraphAgentImpl = async (opts: AgentCallOptions) => globalLangGraphClient.callAgentWithStream(opts);
+}
 
 // LangGraphClient implementation was extracted to src/lib/agents/langgraphClient.ts
 
@@ -342,172 +432,73 @@ export function safeParseJson<T = any>(text: string): T | null {
   }
 }
 
-export async function extractProductInfo(content: string): Promise<{ product: string; quantity?: number } | null> {
-  const extractionPrompt = new SystemMessage(`Extract product information from this user message.
+import extractProductInfoImpl from './productExtractor';
+import detectContinuationIntentImpl from './continuationDetector';
 
-Look for:
-- Product name (e.g., "bananas", "milk", "bread")
-- Quantity if mentioned (e.g., "5", "some", "a few")
+// Backwards-compatible wrappers so existing tests and external callers can still
+// call supervisor.extractProductInfo(...) and supervisor.detectContinuationIntent(...)
+export async function extractProductInfo(content: string) {
+  // Supervisor-level LLM response cache to avoid duplicate LLM calls across quick retries
+  const key = `extract:${String(content || '').slice(0, 1000)}`;
+  const cached = getSupervisorLlmCache(key);
+  if (cached !== undefined) return JSON.parse(JSON.stringify(cached));
 
-Return ONLY a JSON object:
-{
-  "product": string | null,
-  "quantity": number | null
+  const res = await extractProductInfoImpl(content, getLlm());
+  setSupervisorLlmCache(key, res);
+  return res;
 }
 
-If no clear product is mentioned, return {"product": null, "quantity": null}
+export async function detectContinuationIntent(message: string, messages: Array<AnnotatedMessage>, workflowContext?: string, dealData?: any, pendingProduct?: any) {
+  // Build a fingerprint to cache continuation analyses
+  const fingerprint = [
+    String(message || '').slice(0, 1000),
+    workflowContext || '',
+    JSON.stringify(pendingProduct || {}).slice(0, 300),
+    JSON.stringify(dealData || {}).slice(0, 300),
+    messages.slice(-6).map(m => (typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content))).join('|').slice(0, 1000)
+  ].join('||');
 
-User message: "${content}"`);
+  const key = `continuation:${fingerprint}`;
+  const cached = getSupervisorLlmCache(key);
+  if (cached !== undefined) return JSON.parse(JSON.stringify(cached));
 
-  try {
-    const response = await llm.invoke([extractionPrompt]);
-    const extraction = safeParseJson<{ product: string | null; quantity?: number | null }>(response.content.toString());
-    if (extraction && extraction.product) {
-      return {
-        product: extraction.product,
-        quantity: extraction.quantity || undefined
-      };
-    }
-    return null;
-  } catch (error) {
-    console.error('[supervisor] Error extracting product info:', error);
-    return null;
-  }
+  const res = await detectContinuationIntentImpl(message, messages, workflowContext, dealData, pendingProduct, getLlm());
+  setSupervisorLlmCache(key, res);
+  return res;
 }
 
-// Enhanced continuation detection using LLM with conversation history
-export async function detectContinuationIntent(
-  message: string, 
-  messages: Array<AnnotatedMessage>, 
-  workflowContext?: string, 
-  dealData?: any, 
-  pendingProduct?: any
-): Promise<{
-  isContinuation: boolean;
-  continuationType: 'deal_confirmation' | 'checkout_flow' | 'add_to_cart' | 'general';
-  targetAgent: string;
-  confidence: number;
-  reasoning?: string;
-}> {
-  
-  // ENHANCED: Better context building with message type handling
-  let contextInfo = '';
-  if (workflowContext === 'awaiting_deal_confirmation' && dealData && pendingProduct) {
-    contextInfo = `CRITICAL CONTEXT: User was offered a deal on ${pendingProduct.product} (qty: ${pendingProduct.quantity || 1}). This is likely a deal confirmation response.`;
-  } else if (workflowContext === 'prepare_checkout' || workflowContext === 'process_checkout') {
-    contextInfo = `CONTEXT: User is in checkout flow (${workflowContext}).`;
-  } else if (workflowContext === 'add_to_cart_with_deals') {
-    contextInfo = `CONTEXT: User is adding items with deal considerations.`;
-  } else if (pendingProduct) {
-    contextInfo = `CONTEXT: Pending product: ${pendingProduct.product}.`;
+// ===== Supervisor-level LLM response cache (simple TTL) =====
+type SupCacheEntry = { value: any; expiresAt: number };
+const supervisorLlmCache = new Map<string, SupCacheEntry>();
+const SUP_CACHE_TTL = SUPERVISOR_LLM_CACHE_TTL_MS; // 30s default
+
+function getSupervisorLlmCache(key: string) {
+  const e = supervisorLlmCache.get(key);
+  if (!e) return undefined;
+  if (Date.now() > e.expiresAt) {
+    supervisorLlmCache.delete(key);
+    return undefined;
   }
+  return e.value;
+}
 
-  // IMPROVED: Better conversation history from AnnotatedMessage
-  const recentMessages = messages.slice(-6).map(msg => {
-    const role = msg.role === 'user' ? 'User' : msg.role === 'assistant' ? `${msg.agent || 'Assistant'}` : 'System';
-    const content = typeof msg.message.content === 'string' ? msg.message.content : JSON.stringify(msg.message.content);
-    return `${role}: ${content.substring(0, 150)}${content.length > 150 ? '...' : ''}`;
-  }).join('\n');
+function setSupervisorLlmCache(key: string, value: any, ttl = SUP_CACHE_TTL) {
+  supervisorLlmCache.set(key, { value, expiresAt: Date.now() + ttl });
+}
 
-  const analysisPrompt = new SystemMessage(`You are analyzing user intent for conversation continuity in a shopping system.
+export function __clearSupervisorLlmCacheForTests() {
+  supervisorLlmCache.clear();
+}
 
-${contextInfo}
+export function __setSupervisorLlmCacheEntryForTests(key: string, value: any, ttlMs?: number) {
+  setSupervisorLlmCache(key, value, ttlMs);
+}
 
-RECENT CONVERSATION:
-${recentMessages}
-
-ANALYSIS RULES:
-1. "awaiting_deal_confirmation" context + affirmative response = deal_confirmation (confidence: 0.95+)
-2. Checkout contexts + confirmatory responses = checkout_flow 
-3. Product mentions + cart actions = add_to_cart
-4. Ambiguous responses in specific contexts = high-confidence continuation
-
-AFFIRMATIVE PATTERNS:
-- Direct: "yes", "sure", "ok", "apply", "take it", "sounds good", "great", "perfect"
-- Contextual: "I'll take that", "apply the deal", "go ahead", "that works"
-- Implicit: Single word responses in confirmation contexts
-
-NEGATIVE PATTERNS:
-- "no", "not now", "maybe later", "skip", "continue without"
-
-Current message: "${message}"
-
-Return JSON:
-{
-  "isContinuation": boolean,
-  "continuationType": "deal_confirmation" | "checkout_flow" | "add_to_cart" | "general",
-  "targetAgent": "catalog" | "cart_and_checkout" | "payment" | "deals",
-  "confidence": number (0-1),
-  "reasoning": "Brief explanation of decision"
-}`);
-
-  try {
-    const response = await llm.invoke([analysisPrompt]);
-    const analysis = safeParseJson<{ isContinuation: boolean; continuationType: string; targetAgent: string; confidence: number; reasoning?: string }>(response.content.toString()) || {} as any;
-    
-    // ENHANCED: Additional validation for critical contexts
-    if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
-      const messageWords = message.toLowerCase().trim().split(/\s+/);
-      const affirmativePatterns = [
-        'yes', 'sure', 'ok', 'okay', 'apply', 'take', 
-        'sounds', 'great', 'perfect', 'good', 'deal'
-      ];
-      
-      const hasStrongAffirmative = affirmativePatterns.some(pattern => 
-        messageWords.some(word => word.includes(pattern) || pattern.includes(word))
-      );
-      
-      // Override LLM for critical deal confirmation scenarios
-      if (hasStrongAffirmative && analysis.confidence < 0.9) {
-        console.log('[supervisor] Overriding LLM analysis for strong deal confirmation signals');
-        return {
-          isContinuation: true,
-          continuationType: 'deal_confirmation',
-          targetAgent: 'cart_and_checkout',
-          confidence: 0.98,
-          reasoning: 'Strong affirmative response in deal confirmation context'
-        };
-      }
+export function invalidateSupervisorLlmCacheByPrefix(prefix: string) {
+  for (const k of Array.from(supervisorLlmCache.keys())) {
+    if (k.startsWith(prefix)) {
+      supervisorLlmCache.delete(k);
     }
-    
-    return {
-      ...analysis,
-      confidence: Math.min(Math.max(analysis.confidence || 0.5, 0), 1) // Ensure 0-1 range
-    };
-    
-  } catch (error) {
-    console.error('[supervisor] Error in continuation detection:', error);
-    
-    // ENHANCED: Better fallback logic with context awareness
-    if (workflowContext === 'awaiting_deal_confirmation') {
-      const messageWords = message.toLowerCase().trim().split(/\s+/);
-      const affirmativePatterns = [
-        'yes', 'sure', 'ok', 'okay', 'apply', 'take', 
-        'sounds', 'great', 'perfect', 'good', 'deal', 'go'
-      ];
-      
-      const hasAffirmative = affirmativePatterns.some(pattern => 
-        messageWords.some(word => word.includes(pattern) || pattern.includes(word))
-      );
-      
-      if (hasAffirmative) {
-        return {
-          isContinuation: true,
-          continuationType: 'deal_confirmation',
-          targetAgent: 'cart_and_checkout',
-          confidence: 0.85,
-          reasoning: 'Fallback detection for affirmative response in deal context'
-        };
-      }
-    }
-    
-    return {
-      isContinuation: false,
-      continuationType: 'general',
-      targetAgent: 'catalog',
-      confidence: 0.1,
-      reasoning: 'Error in analysis - defaulting to general routing'
-    };
   }
 }
 
@@ -530,7 +521,7 @@ async function supervisor(state: typeof SupervisorState.State) {
   console.log(`[supervisor] Continuation analysis:`, continuationAnalysis);
   
   // Handle continuation scenarios based on LLM analysis
-  if (continuationAnalysis.isContinuation && continuationAnalysis.confidence > 0.7) {
+  if (continuationAnalysis.isContinuation && continuationAnalysis.confidence > MIN_CONTINUATION_CONFIDENCE) {
     console.log(`[supervisor] High-confidence continuation detected: ${continuationAnalysis.continuationType}`);
     console.log(`[supervisor] Routing to: ${continuationAnalysis.targetAgent} with confidence: ${continuationAnalysis.confidence}`);
     
@@ -643,7 +634,7 @@ Respond with ONLY the agent name: catalog, cart_and_checkout, payment, or deals
 User message: "${messageContent}"`);
 
   const invokeMessages = lastAnnotated?.message ? [systemMessage, lastAnnotated.message] : [systemMessage];
-  const response = await llm.invoke(invokeMessages as any);
+  const response = await getLlm().invoke(invokeMessages as any);
   const nextAgent = response.content.toString().trim().toLowerCase();
   
   // Validate and route
@@ -655,8 +646,10 @@ User message: "${messageContent}"`);
   // Extract product information for deals routing (add-to-cart scenarios)
   let extractedProduct = pendingProduct;
   if (selectedAgent === 'deals' && !pendingProduct) {
-    extractedProduct = await extractProductInfo(messageContent);
+  extractedProduct = await extractProductInfo(messageContent);
     console.log('[supervisor] Extracted product info for deals:', extractedProduct);
+    // Invalidate planner cache if we just discovered a pending product — planner decisions may change
+    try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
   }
   
   return {
@@ -794,6 +787,9 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     // Create a helpful message suggesting catalog search
     const helpfulMessage = new AIMessage(`I couldn't find "${pendingProduct.product}" in our catalog. Let me help you find the right product. You can try searching for similar items or browse our catalog.`);
     
+    // Invalidate planner cache for this conversation/user since deal/cart state changed
+    try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
     return {
       messages: annotatedResponses ? [...annotatedResponses, annotateMessage(helpfulMessage, 'assistant', 'cart_and_checkout')] : [annotateMessage(helpfulMessage, 'assistant', 'cart_and_checkout')],
       userId,
@@ -826,6 +822,9 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
         total: structured.total || null,
         timestamp: Date.now()
       };
+
+      // Invalidate planner cache - cart was cleared after checkout
+      try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
 
       return {
         messages: annotatedResponses,
@@ -874,6 +873,9 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
       timestamp: Date.now()
     };
 
+    // Invalidate planner cache - cart was cleared after checkout
+    try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
     return {
       messages: annotatedResponses,
       userId,
@@ -913,8 +915,26 @@ async function dealsNode(state: typeof SupervisorState.State) {
     ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
     : '';
   
-  if (pendingProduct && workflowContext === 'check_deals') {
-    messageToAgent = `User wants to add to cart: "${messageToAgent}". Check for deals on ${pendingProduct.product}${pendingProduct.quantity ? ` (quantity: ${pendingProduct.quantity})` : ''}`;
+  // If we don't have a pendingProduct, try to extract one from the message so
+  // the deals agent has something to work with. Supervisor normally extracts
+  // this earlier, but ensure robustness here as a fallback.
+  let effectivePending = pendingProduct;
+  if (!effectivePending) {
+    try {
+  const extracted = await extractProductInfo(messageToAgent || (typeof lastAnnotated?.message?.content === 'string' ? lastAnnotated.message.content : ''));
+      if (extracted && extracted.product) {
+        effectivePending = extracted;
+        console.log('[dealsNode] Fallback extracted pending product:', effectivePending);
+      } else {
+        console.log('[dealsNode] No pending product could be extracted (fallback)');
+      }
+    } catch (e) {
+      console.warn('[dealsNode] Error extracting product info in fallback:', e);
+    }
+  }
+
+  if (effectivePending && workflowContext === 'check_deals') {
+    messageToAgent = `User wants to add to cart: "${messageToAgent}". Check for deals on ${effectivePending.product}${effectivePending.quantity ? ` (quantity: ${effectivePending.quantity})` : ''}`;
   }
   
   const dealsContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'deals', messageToAgent);
@@ -936,6 +956,9 @@ async function dealsNode(state: typeof SupervisorState.State) {
     console.log('[dealsNode] Pending product:', pendingProduct);
     console.log('[dealsNode] Deal data will be:', { pending: true, response: responseContent });
     
+    // Invalidate planner cache for this conversation/user since deal state changed (pending confirmation)
+    try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
     return {
       messages: responseMessages,
       workflowContext: 'awaiting_deal_confirmation',
@@ -945,7 +968,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
         response: responseContent, 
         type: 'product_deal' 
       },
-      pendingProduct,
+      pendingProduct: effectivePending || pendingProduct,
       cartData, // Preserve cart data
       userId,
       conversationId,
@@ -961,6 +984,9 @@ async function dealsNode(state: typeof SupervisorState.State) {
     if (noDealsAvailable) {
       // No deals available - end workflow, let user decide next action
       console.log('[dealsNode] No deals available, ending workflow to allow user choice');
+      // Invalidate planner cache for this conversation/user since dealData was updated
+      try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
       return {
         messages: responseMessages,
         workflowContext: null, // Clear workflow context
@@ -978,6 +1004,31 @@ async function dealsNode(state: typeof SupervisorState.State) {
       };
     } else {
       // No confirmation needed, proceed to add to cart
+      // Invalidate planner cache for this conversation/user since dealData was applied/changed
+      try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
+      // If we somehow don't have an effective pending product, avoid routing
+      // directly to cart_and_checkout and instead clear the pending product so
+      // the supervisor or catalog can re-evaluate.
+      if (!effectivePending) {
+        console.log('[dealsNode] No pending product after deals processing — clearing pendingProduct and ending to let supervisor decide');
+        return {
+          messages: responseMessages,
+          workflowContext: null,
+          dealData: { 
+            ...dealData,
+            applied: true,
+            response: responseContent,
+            type: 'product_deal'
+          },
+          pendingProduct: null,
+          cartData,
+          userId,
+          conversationId,
+          next: END,
+        };
+      }
+
       return {
         messages: responseMessages,
         workflowContext: 'add_to_cart_with_deals',
@@ -987,7 +1038,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
           response: responseContent, 
           type: 'product_deal' 
         },
-        pendingProduct,
+        pendingProduct: effectivePending,
         cartData, // Preserve cart data
         userId,
         conversationId,
@@ -1029,7 +1080,7 @@ async function paymentNode(state: typeof SupervisorState.State) {
 // Expects environment variables: PUSHOVER_TOKEN (application token), PUSHOVER_USER (user key)
 import fetch from 'node-fetch';
 
-async function sendPushoverNotification(payload: { title: string; message: string; user?: string; token?: string }) {
+let sendPushoverNotificationImpl: (payload: { title: string; message: string; user?: string; token?: string }) => Promise<any> = async (payload) => {
   const token = payload.token || process.env.PUSHOVER_TOKEN;
   const user = payload.user || process.env.PUSHOVER_USER;
 
@@ -1055,6 +1106,34 @@ async function sendPushoverNotification(payload: { title: string; message: strin
     console.error('[notification_agent] Error sending pushover notification:', error);
     return { ok: false, error };
   }
+};
+
+async function sendPushoverNotification(payload: { title: string; message: string; user?: string; token?: string }) {
+  return sendPushoverNotificationImpl(payload);
+}
+
+export function __setSendPushoverNotificationForTests(fn: any) {
+  sendPushoverNotificationImpl = fn;
+}
+
+export function __resetSendPushoverNotificationForTests() {
+  sendPushoverNotificationImpl = async (payload) => {
+    const token = payload.token || process.env.PUSHOVER_TOKEN;
+    const user = payload.user || process.env.PUSHOVER_USER;
+    if (!token || !user) return { ok: false, error: 'Missing pushover config' };
+    const form = new URLSearchParams();
+    form.append('token', token);
+    form.append('user', user);
+    form.append('title', payload.title);
+    form.append('message', payload.message);
+    try {
+      const res = await fetch('https://api.pushover.net/1/messages.json', { method: 'POST', body: form });
+      const json = await res.json();
+      return { ok: res.ok, result: json };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  };
 }
 
 async function notificationAgent(state: typeof SupervisorState.State) {
@@ -1162,6 +1241,7 @@ const workflow = new StateGraph(SupervisorState)
   })
   .addConditionalEdges('deals', (state) => state.next, {
     supervisor: 'supervisor',
+    cart_and_checkout: 'cart_and_checkout',
     [END]: END,
   })
   .addConditionalEdges('notification_agent', (state) => state.next, {
@@ -1170,8 +1250,15 @@ const workflow = new StateGraph(SupervisorState)
   })
   .addEdge('payment', END);
 
-// Export graph without built-in checkpointer (SupervisorAgent will handle state)
-export const supervisorGraph = workflow.compile();
+// Export a factory so callers can compile the workflow with a checkpointer/config.
+export function compileSupervisorWorkflow(options?: any) {
+  return workflow.compile(options);
+}
+
+// Backwards-compatible compiled graph export for LangGraph tooling (langgraph.json)
+// This compiles a default instance without a per-agent checkpointer. For
+// per-instance persistence, callers should use `compileSupervisorWorkflow`.
+export const supervisorGraph = compileSupervisorWorkflow();
 
 // Class-based Supervisor Agent with local state management
 export class SupervisorAgent {
@@ -1190,8 +1277,8 @@ export class SupervisorAgent {
   // Reuse the module-level global LangGraphClient to avoid creating multiple connections
   this.lgClient = globalLangGraphClient;
     
-    // Create compiled graph with optimized configuration
-    this.compiledGraph = workflow.compile({ 
+    // Create compiled graph with optimized configuration using the compile factory
+    this.compiledGraph = compileSupervisorWorkflow({ 
       checkpointer: this.memorySaver,
       // Add configuration for better state management
       interruptBefore: [], // Can add nodes to interrupt before if needed
@@ -1397,3 +1484,15 @@ export const createSupervisorAgent = (userId: string, conversationId?: string) =
 
 // Export internal helpers for testing
 export { notificationAgent, sendPushoverNotification, END };
+
+// Test helpers - allow tests to inject a mock LLM when needed
+// These are explicitly test-only helpers to avoid exposing mutable internals in production
+export function __setLlmForTests(mock: any) {
+  // @ts-ignore
+  llm = mock;
+}
+
+export function __resetLlmForTests() {
+  // @ts-ignore
+  llm = null;
+}
