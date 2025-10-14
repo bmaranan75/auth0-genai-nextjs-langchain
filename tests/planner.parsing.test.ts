@@ -22,9 +22,9 @@ describe('planner parsing and fallback behavior', () => {
     const res = await planner(state as any);
     expect(res).toBeDefined();
     expect(res.messages).toBeDefined();
-    const delegation = (res.messages[0] as any).delegation;
-    expect(delegation.targetAgent).toBe('catalog');
-    expect(delegation.confidence).toBeGreaterThan(0.8);
+    const recommendation = (res.messages[0] as any).planningRecommendation;
+    expect(recommendation.targetAgent).toBe('catalog');
+    expect(recommendation.confidence).toBeGreaterThan(0.8);
   });
 
   it('falls back to supervisor when LLM returns malformed JSON', async () => {
@@ -35,9 +35,9 @@ describe('planner parsing and fallback behavior', () => {
     const state = makeStateWithMessages([ { content: 'Find apples' } ]);
     const res = await planner(state as any);
     expect(res).toBeDefined();
-    const delegation = (res.messages[0] as any).delegation;
-    expect(delegation.targetAgent).toBe('supervisor');
-    expect(typeof delegation.reasoning).toBe('string');
+    const recommendation = (res.messages[0] as any).planningRecommendation;
+    expect(recommendation.targetAgent).toBe('supervisor');
+    expect(typeof recommendation.reasoning).toBe('string');
   });
 
   it('normalizes invalid targetAgent to supervisor', async () => {
@@ -47,8 +47,8 @@ describe('planner parsing and fallback behavior', () => {
 
     const state = makeStateWithMessages([ { content: 'Whatever' } ]);
     const res = await planner(state as any);
-    const delegation = (res.messages[0] as any).delegation;
+    const recommendation = (res.messages[0] as any).planningRecommendation;
     // Since planner validation forces supervisor for unknown agents, expect supervisor
-    expect(delegation.targetAgent).toBe('supervisor');
+    expect(recommendation.targetAgent).toBe('supervisor');
   });
 });

@@ -10,7 +10,7 @@ function makeState(messages: any[], delegationDepth?: number) {
 }
 
 describe('routePlanner delegation depth guard', () => {
-  it('should allow delegation when depth is below max', () => {
+  it('should route to supervisor and store recommendation when depth is below max', () => {
     const plannerDelegationMsg = {
       delegation: {
         targetAgent: 'catalog',
@@ -23,7 +23,15 @@ describe('routePlanner delegation depth guard', () => {
 
     const state = makeState([plannerDelegationMsg], 1);
     const res = routePlanner(state as any);
-    expect(res).toBe('catalog');
+    // NEW ARCHITECTURE: All recommendations go through supervisor for proper separation of concerns
+    expect(res).toBe('supervisor');
+    // Ensure the recommendation is stored in state
+    expect(state.plannerRecommendation).toEqual({
+      targetAgent: 'catalog',
+      confidence: 0.9,
+      task: 'find apples',
+      reasoning: 'looks like a product search'
+    });
     // ensure the state increment happened
     expect(state.delegationDepth).toBe(2);
   });
@@ -41,9 +49,9 @@ describe('routePlanner delegation depth guard', () => {
 
     const state = makeState([plannerDelegationMsg], 3);
     const res = routePlanner(state as any);
-    // At max depth, supervisor should be chosen to avoid further delegation
+    // NEW ARCHITECTURE: Always routes to supervisor (regardless of depth, since all delegation goes through supervisor)
     expect(res).toBe('supervisor');
-    // delegationDepth should remain unchanged or be a number
-    expect(typeof state.delegationDepth).toBe('number');
+    // delegationDepth should be incremented properly
+    expect(state.delegationDepth).toBe(4);
   });
 });

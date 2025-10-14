@@ -50,50 +50,27 @@ export const routePlanner = (state: typeof SupervisorState.State) => {
 
   console.log("[routePlanner] Processing planner response:", JSON.stringify(lastMessage, null, 2));
 
-  const MAX_DELEGATION_DEPTH = 3;
-  const MIN_CONFIDENCE = SAFE_MIN_PLANNER_CONFIDENCE; // planner must be somewhat confident before delegating
-
-  // Check if this is a planner delegation
-  if (lastMessage && lastMessage.delegation) {
-    const delegation = lastMessage.delegation as any;
-
-    // Basic schema validation (defensive)
-    if (!delegation || typeof delegation !== 'object' || !delegation.targetAgent || typeof delegation.targetAgent !== 'string') {
-      console.warn('[routePlanner] Invalid delegation object from planner, falling back to supervisor', delegation);
-      return 'supervisor';
-    }
-
-    const { targetAgent, confidence } = delegation;
-    console.log(`[routePlanner] Routing based on planner delegation to: ${targetAgent} (confidence: ${confidence})`);
-
-    // Prevent delegation loops
-    if ((delegationDepth as number) >= MAX_DELEGATION_DEPTH) {
-      console.warn('[routePlanner] Max delegation depth exceeded, routing to supervisor');
-      return 'supervisor';
-    }
-
-    // Validate that the target agent exists in our graph
-    const validAgents = ["catalog", "cart_and_checkout", "deals", "payment", "notification_agent", "supervisor"];
-    if (!validAgents.includes(targetAgent)) {
-      console.warn(`[routePlanner] Invalid target agent: ${targetAgent}, falling back to supervisor`);
-      return 'supervisor';
-    }
-
-    // Confidence guard: only delegate when above threshold
-    if (typeof confidence === 'number' && confidence < MIN_CONFIDENCE) {
-      console.warn(`[routePlanner] Planner confidence too low (${confidence}), routing to supervisor`);
-      return 'supervisor';
-    }
-
-    // All checks passed — route to the requested agent
-    // Increment delegation depth on the state so downstream nodes see it
+  // CRITICAL CHANGE: Planner now only provides recommendations, not executable delegations
+  // ALL routing decisions are made by the supervisor to enforce separation of concerns
+  
+  // Check if this is a planner recommendation
+  if (lastMessage && (lastMessage.planningRecommendation || lastMessage.delegation)) {
+    const recommendation = lastMessage.planningRecommendation || lastMessage.delegation; // Support both for compatibility
+    
+    console.log(`[routePlanner] Received planner recommendation:`, recommendation);
+    
+    // Store the recommendation in state for supervisor to use, but ALWAYS route to supervisor
     try {
+      (state as any).plannerRecommendation = recommendation;
       (state as any).delegationDepth = (delegationDepth as number) + 1;
-      console.log(`[routePlanner] Incremented delegationDepth → ${(state as any).delegationDepth}`);
+      console.log(`[routePlanner] Stored recommendation and incremented delegationDepth → ${(state as any).delegationDepth}`);
     } catch (e) {
-      console.warn('[routePlanner] Could not increment delegationDepth on state', e);
+      console.warn('[routePlanner] Could not store recommendation on state', e);
     }
-    return targetAgent;
+    
+    // ALWAYS route to supervisor - it will make the actual delegation decision
+    console.log('[routePlanner] Routing to supervisor for delegation decision');
+    return 'supervisor';
   }
 
   // Check for tool calls in the message
@@ -323,6 +300,15 @@ const SupervisorState = Annotation.Root({
       return { ...x, ...y };
     },
   }),
+  // Planner recommendation to be processed by supervisor
+  plannerRecommendation: Annotation<any>({
+    reducer: (x, y) => {
+      if (y === null) return null; // Explicit clear
+      if (!y) return x;
+      // Store the latest planner recommendation
+      return y;
+    },
+  }),
 });
 
 // Lazily initialize a ChatOpenAI instance so tests without API keys don't throw at import time
@@ -504,7 +490,7 @@ export function invalidateSupervisorLlmCacheByPrefix(prefix: string) {
 
 // Supervisor function to route requests
 async function supervisor(state: typeof SupervisorState.State) {
-  const { messages, userId, conversationId, cartData, workflowContext, dealData, pendingProduct } = state;
+  const { messages, userId, conversationId, cartData, workflowContext, dealData, pendingProduct, plannerRecommendation } = state as any;
   const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
   const messageContent = lastAnnotated && lastAnnotated.message
     ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
@@ -514,8 +500,79 @@ async function supervisor(state: typeof SupervisorState.State) {
   console.log(`[supervisor] Cart data available: ${!!cartData}`);
   console.log(`[supervisor] Deal data available: ${!!dealData}`);
   console.log(`[supervisor] Pending product: ${!!pendingProduct}`);
+  console.log(`[supervisor] Planner recommendation:`, plannerRecommendation);
   
-  // Enhanced continuation detection
+  // FIRST: Handle planner recommendations with supervisor's delegation logic
+  if (plannerRecommendation) {
+    const { action, targetAgent, confidence, reasoning } = plannerRecommendation;
+    console.log(`[supervisor] Processing planner recommendation: action=${action}, targetAgent=${targetAgent}, confidence=${confidence}`);
+    
+    // If planner recommends direct response, validate and handle
+    if (action === 'direct_response') {
+      console.log(`[supervisor] Planner recommends direct response: ${reasoning}`);
+      // For direct responses, we can return immediately without agent delegation
+      const directResponse = new AIMessage(reasoning || 'I can help you with that.');
+      return {
+        messages: [{
+          message: directResponse,
+          role: 'assistant',
+          agent: 'supervisor',
+          timestamp: Date.now()
+        }],
+        userId,
+        conversationId,
+        workflowContext,
+        dealData,
+        pendingProduct,
+        cartData,
+        next: END
+      };
+    }
+    
+    // For delegation recommendations, apply supervisor's business logic and validation
+    if (action === 'delegate' && targetAgent) {
+      console.log(`[supervisor] Planner recommends delegation to: ${targetAgent} (confidence: ${confidence})`);
+      
+      // Apply supervisor's context-aware validation and routing
+      const validAgents = ['catalog', 'cart_and_checkout', 'deals', 'payment', 'notification_agent'];
+      
+      // Supervisor makes the final decision based on context and planner recommendation
+      let finalTargetAgent = targetAgent;
+      
+      // Override planner recommendation based on current context if needed
+      if (workflowContext === 'add_to_cart_with_deals' && pendingProduct) {
+        console.log(`[supervisor] OVERRIDE: Context requires cart_and_checkout despite planner recommendation`);
+        finalTargetAgent = 'cart_and_checkout';
+      } else if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
+        console.log(`[supervisor] OVERRIDE: Context requires continuation flow analysis`);
+        // Continue to regular flow for continuation analysis
+      } else if (validAgents.includes(targetAgent) && confidence && confidence > 0.7) {
+        // High confidence planner recommendation - use it
+        console.log(`[supervisor] High confidence planner recommendation accepted: ${targetAgent}`);
+        finalTargetAgent = targetAgent;
+      } else {
+        // Low confidence or complex scenario - apply supervisor logic
+        console.log(`[supervisor] Applying supervisor logic due to low confidence or complex scenario`);
+        // Continue to regular continuation detection and routing logic below
+      }
+      
+      // If we have a final decision from planner recommendation, execute it
+      if (finalTargetAgent !== targetAgent || (confidence && confidence > 0.7)) {
+        return {
+          next: finalTargetAgent,
+          userId,
+          conversationId,
+          workflowContext,
+          dealData,
+          pendingProduct,
+          cartData,
+          messages: lastAnnotated ? [lastAnnotated] : []
+        };
+      }
+    }
+  }
+  
+  // Enhanced continuation detection (fallback when planner recommendations are not sufficient)
   const continuationAnalysis = await detectContinuationIntent(messageContent, messages, workflowContext, dealData, pendingProduct);
   
   console.log(`[supervisor] Continuation analysis:`, continuationAnalysis);
@@ -584,7 +641,7 @@ async function supervisor(state: typeof SupervisorState.State) {
     ];
     
     const hasAffirmative = affirmativePatterns.some(pattern => 
-      messageWords.some(word => word.includes(pattern) || pattern.includes(word))
+      messageWords.some((word: string) => word.includes(pattern) || pattern.includes(word))
     );
     
     if (hasAffirmative) {
@@ -1216,12 +1273,8 @@ const workflow = new StateGraph(SupervisorState)
   .addConditionalEdges('planner', routePlanner, {
     [END]: END,
     supervisor: 'supervisor',
-    tools: 'tools',
-    catalog: 'catalog',
-    cart_and_checkout: 'cart_and_checkout',
-    deals: 'deals',
-    payment: 'payment',
-    notification_agent: 'notification_agent',
+    tools: 'tools'
+    // REMOVED direct agent routing - all delegation now goes through supervisor
   })
   .addConditionalEdges('supervisor', (state) => state.next, {
     catalog: 'catalog',

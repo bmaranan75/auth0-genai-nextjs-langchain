@@ -9,7 +9,7 @@ const CURRENT_WEEK_DEALS = {
     originalPrice: 1.29,
     dealPrice: 1.03,
     description: 'Save 20% on fresh bananas this week!',
-    validUntil: '2025-10-10',
+    validUntil: '2025-10-31',
     dealId: 'BANANA_OCT_2025'
   },
   'milk': {
@@ -18,7 +18,7 @@ const CURRENT_WEEK_DEALS = {
     originalPrice: 3.99,
     dealPrice: 3.99,
     description: 'Buy 2 gallons of milk, get 50% off the second one!',
-    validUntil: '2025-10-08',
+    validUntil: '2025-10-31',
     dealId: 'MILK_BOGO_OCT_2025',
     minQuantity: 2
   },
@@ -28,7 +28,7 @@ const CURRENT_WEEK_DEALS = {
     originalPrice: 2.99,
     dealPrice: 1.99,
     description: '$1 off per bag of fresh apples!',
-    validUntil: '2025-10-09',
+    validUntil: '2025-10-31',
     dealId: 'APPLE_DOLLAR_OFF_2025'
   },
   'bread': {
@@ -37,7 +37,7 @@ const CURRENT_WEEK_DEALS = {
     originalPrice: 2.49,
     dealPrice: 2.12,
     description: '15% off artisan bread this week!',
-    validUntil: '2025-10-12',
+    validUntil: '2025-10-31',
     dealId: 'BREAD_15_OFF_2025'
   }
 };

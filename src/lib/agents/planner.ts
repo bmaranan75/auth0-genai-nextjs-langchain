@@ -17,8 +17,8 @@ function getPlannerLlm() {
     // Fallback mock for test environments: deterministic minimal API compatible object
     plannerLlm = {
       invoke: async (msgs: any) => {
-        // Return a conservative delegate to supervisor to be safe
-        return { content: JSON.stringify({ action: 'delegate', targetAgent: 'supervisor', confidence: 0.5, reasoning: 'fallback mock' }) };
+        // Return a conservative recommendation to supervisor to be safe
+        return { content: JSON.stringify({ action: 'delegate', targetAgent: 'supervisor', confidence: 0.5, reasoning: 'fallback mock recommendation' }) };
       }
     };
     return plannerLlm;
@@ -81,7 +81,7 @@ export function resetPlannerMetrics() {
 const plannerPrompt = ChatPromptTemplate.fromMessages([
   [
     "system",
-    `You are an intelligent routing planner for a grocery shopping assistant. 
+    `You are an intelligent planning assistant for a grocery shopping system. You analyze requests and provide recommendations - you do NOT execute any actions.
 
 AVAILABLE SPECIALIZED AGENTS AND THEIR CAPABILITIES:
 - catalog: Product search, catalog browsing, finding products, availability checks, product information
@@ -91,38 +91,39 @@ AVAILABLE SPECIALIZED AGENTS AND THEIR CAPABILITIES:
 - notification_agent: Order notifications, confirmations, status updates
 - supervisor: Complex workflows requiring multiple agents, multi-step processes, deal confirmations
 
-YOUR DECISION PROCESS:
-1. DIRECT RESPONSE: Answer immediately if it's a simple greeting, general advice, store policies, or basic question you can answer without specialized knowledge
-2. DELEGATE TO AGENT: Route to the appropriate specialized agent for specific tasks, OR to supervisor for complex workflows
+YOUR ROLE (PLANNING ONLY):
+1. ANALYZE the user's request and determine the appropriate handling approach
+2. RECOMMEND either:
+   - direct_response: For simple greetings, general advice, or basic questions
+   - delegate: For specialized tasks requiring agent assistance
+3. PROVIDE reasoning for your recommendation
 
-KEY ROUTING PATTERNS:
-- Questions about deals, discounts, promotions, savings, special offers → ALWAYS delegate to deals agent
-- Product search, finding items, browsing catalog → delegate to catalog agent
-- Cart operations (add, view, remove items) → delegate to supervisor for workflow management
-- Payment and billing → delegate to payment agent
+IMPORTANT: You only provide recommendations. The supervisor makes all actual routing decisions.
 
-EXAMPLES:
-- "Hello" → DIRECT RESPONSE
-- "What are your store hours?" → DIRECT RESPONSE  
-- "How do I cook pasta?" → DIRECT RESPONSE (general cooking advice)
-- "Find organic apples" → DELEGATE to catalog
-- "What deals are available today?" → DELEGATE to deals
-- "Check deals for milk" → DELEGATE to deals
-- "Find promotions on vegetables" → DELEGATE to deals
-- "Are there discounts on bread?" → DELEGATE to deals
-- "Show me special offers" → DELEGATE to deals
-- "Add bananas to my cart" → DELEGATE to supervisor (for cart workflow management)
-- "View my cart" → DELEGATE to supervisor (for cart operations)
-- "Checkout my order" → DELEGATE to supervisor (for complex checkout process)
-- "Complete my purchase" → DELEGATE to supervisor (for complex checkout process)
-- "Update my payment method" → DELEGATE to payment
-- "Send me order confirmation" → DELEGATE to notification_agent
+KEY ANALYSIS PATTERNS:
+- Questions about deals, discounts, promotions, savings, special offers → recommend deals agent
+- Product search, finding items, browsing catalog → recommend catalog agent
+- Cart operations (add, view, remove items) → recommend supervisor for workflow management
+- Payment and billing → recommend payment agent
 
-IMPORTANT: Distinguish between:
-- Simple cart operations (add, remove, view) → cart_and_checkout
-- Complex workflows (checkout, multi-step processes) → supervisor
+ANALYSIS EXAMPLES:
+- "Hello" → RECOMMEND: direct_response (simple greeting)
+- "What are your store hours?" → RECOMMEND: direct_response (general information)
+- "How do I cook pasta?" → RECOMMEND: direct_response (general cooking advice)
+- "Find organic apples" → RECOMMEND: delegate to catalog (product search)
+- "What deals are available today?" → RECOMMEND: delegate to deals (deal discovery)
+- "Check deals for milk" → RECOMMEND: delegate to deals (specific deal inquiry)
+- "Find promotions on vegetables" → RECOMMEND: delegate to deals (promotion search)
+- "Are there discounts on bread?" → RECOMMEND: delegate to deals (discount inquiry)
+- "Show me special offers" → RECOMMEND: delegate to deals (offer browsing)
+- "Add bananas to my cart" → RECOMMEND: delegate to supervisor (cart workflow management)
+- "View my cart" → RECOMMEND: delegate to supervisor (cart operations)
+- "Checkout my order" → RECOMMEND: delegate to supervisor (complex checkout process)
+- "Complete my purchase" → RECOMMEND: delegate to supervisor (complex checkout process)
+- "Update my payment method" → RECOMMEND: delegate to payment (payment management)
+- "Send me order confirmation" → RECOMMEND: delegate to notification_agent (notifications)
 
-Choose wisely to minimize unnecessary agent calls while ensuring specialized tasks go to the right agent. Always provide clear reasoning for your delegation choice.`,
+REMEMBER: You provide analysis and recommendations only. All actual routing is handled by the supervisor.`,
   ],
   ["placeholder", "{messages}"],
 ]);
@@ -141,13 +142,14 @@ const planner = async (state: any) => {
     return cached;
   }
 
-  // Build a compact prompt asking for a strict JSON plan output. We include
+  // Build a compact prompt asking for a strict JSON planning recommendation. We include
   // a short system instruction and the last few messages as context.
   const promptMessages = [
     new SystemMessage(
-      `You are a concise planning assistant for routing requests to specialized agents.\n` +
-        `Return strictly valid JSON with the following schema: { action: string, targetAgent?: string, task?: string, confidence: number, reasoning: string }\n` +
-        `action must be one of: direct_response, delegate. confidence between 0 and 1.`
+      `You are a planning assistant that analyzes requests and provides recommendations (NOT executable actions).\n` +
+        `Return strictly valid JSON with the following schema: { action: string, recommendedAgent?: string, task?: string, confidence: number, reasoning: string }\n` +
+        `action must be one of: direct_response, delegate. confidence between 0 and 1.\n` +
+        `CRITICAL: You only provide recommendations. The supervisor makes all actual routing decisions.`
     ),
     ...messages.slice(-6).map((m: any) => m.message).filter(Boolean),
   ];
@@ -156,8 +158,8 @@ const planner = async (state: any) => {
   console.log("[planner] Raw LLM response:", JSON.stringify(response, null, 2));
 
   // Try to parse JSON output from the LLM. If parsing fails, fall back to a
-  // conservative delegate decision to supervisor with low confidence.
-  let plan: { action: string; targetAgent?: string; task?: string; confidence: number; reasoning: string } | null = null;
+  // conservative recommendation to supervisor with low confidence.
+  let plan: { action: string; recommendedAgent?: string; targetAgent?: string; task?: string; confidence: number; reasoning: string } | null = null;
   const textContent = response && typeof (response as any).content === 'string' ? (response as any).content : '';
   const text = textContent || JSON.stringify(response || '');
   try {
@@ -166,13 +168,13 @@ const planner = async (state: any) => {
     const jsonText = jsonStart >= 0 ? text.slice(jsonStart) : text;
     plan = JSON.parse(jsonText);
   } catch (e) {
-    console.error('[planner] Failed to parse plan JSON, returning fallback delegate plan', e);
+    console.error('[planner] Failed to parse plan JSON, returning fallback recommendation', e);
     plan = {
       action: 'delegate',
-      targetAgent: 'supervisor',
+      targetAgent: 'supervisor', // Using targetAgent for backward compatibility
       task: text.slice(0, 1000),
       confidence: 0.5,
-      reasoning: 'Could not parse JSON plan from planner LLM; defaulting to supervisor delegation.'
+      reasoning: 'Could not parse JSON plan from planner LLM; recommending supervisor.'
     };
   }
 
@@ -180,17 +182,17 @@ const planner = async (state: any) => {
   if (!plan) {
     plan = {
       action: 'delegate',
-      targetAgent: 'supervisor',
+      targetAgent: 'supervisor', // Using targetAgent for backward compatibility
       task: text.slice(0, 1000),
       confidence: 0.5,
-      reasoning: 'Planner returned no plan; defaulting to supervisor.'
+      reasoning: 'Planner returned no plan; recommending supervisor.'
     };
   }
 
   plan.confidence = Math.max(0, Math.min(1, (plan.confidence as number) || 0.5));
   plan.action = (plan.action as string) || 'delegate';
   plan.reasoning = (plan.reasoning as string) || '';
-  // Runtime JSON-schema validation & normalization for planner output
+  // Runtime JSON-schema validation & normalization for planner recommendation
   function validateAndNormalizePlan(input: any) {
     const allowedActions = ['direct_response', 'delegate'];
     const allowedAgents = ['catalog', 'cart_and_checkout', 'deals', 'payment', 'notification_agent', 'supervisor'];
@@ -199,7 +201,7 @@ const planner = async (state: any) => {
         valid: false,
         plan: {
           action: 'delegate',
-          targetAgent: 'supervisor',
+          targetAgent: 'supervisor', // Using targetAgent for backward compatibility
           task: typeof input === 'string' ? input.slice(0, 1000) : JSON.stringify(input).slice(0, 1000),
           confidence: 0.5,
           reasoning: 'Invalid planner output format'
@@ -213,7 +215,7 @@ const planner = async (state: any) => {
         valid: false,
         plan: {
           action: 'delegate',
-          targetAgent: 'supervisor',
+          targetAgent: 'supervisor', // Using targetAgent for backward compatibility
           task: (input.task && String(input.task).slice(0, 1000)) || JSON.stringify(input).slice(0, 1000),
           confidence: 0.5,
           reasoning: 'Planner returned invalid or missing action'
@@ -221,10 +223,12 @@ const planner = async (state: any) => {
       };
     }
 
-    const rawTarget = typeof input.targetAgent === 'string' ? input.targetAgent : undefined;
+    // Handle both old 'targetAgent' and new 'recommendedAgent' for compatibility
+    const rawTarget = typeof input.recommendedAgent === 'string' ? input.recommendedAgent : 
+                     typeof input.targetAgent === 'string' ? input.targetAgent : undefined;
     const normalizedPlan: any = {
       action: rawAction,
-      targetAgent: allowedAgents.includes(String(rawTarget)) ? rawTarget : 'supervisor',
+      targetAgent: allowedAgents.includes(String(rawTarget)) ? rawTarget : 'supervisor', // Using targetAgent for backward compatibility
       task: typeof input.task === 'string' ? input.task : (input.task ? String(input.task) : undefined),
       confidence: typeof input.confidence === 'number' ? Math.max(0, Math.min(1, input.confidence)) : 0.5,
       reasoning: typeof input.reasoning === 'string' ? input.reasoning : (input.reasoning ? String(input.reasoning) : '')
@@ -233,7 +237,7 @@ const planner = async (state: any) => {
     // If direct_response, ensure there's at least some text in 'task' or 'reasoning'
     if (normalizedPlan.action === 'direct_response' && !normalizedPlan.task && !normalizedPlan.reasoning) {
       normalizedPlan.action = 'delegate';
-      normalizedPlan.targetAgent = 'supervisor';
+      normalizedPlan.targetAgent = 'supervisor'; // Using targetAgent for backward compatibility
       normalizedPlan.confidence = Math.min(normalizedPlan.confidence, 0.6);
       normalizedPlan.reasoning = 'Converted to delegate because direct_response lacked content';
       return { valid: false, plan: normalizedPlan };
@@ -244,8 +248,8 @@ const planner = async (state: any) => {
 
   const { valid, plan: finalPlan } = validateAndNormalizePlan(plan);
 
-  // Package as an AIMessage with delegation metadata so supervisor can consume it
-  // AIMessage expects a string content, so pass the stringified JSON directly.
+  // Package as an AIMessage with planning recommendation (not executable delegation)
+  // The planner only provides recommendations - supervisor handles all delegation
   const normalized = new AIMessage(JSON.stringify(finalPlan));
 
   const resultPayload = {
@@ -255,7 +259,7 @@ const planner = async (state: any) => {
         role: 'assistant',
         agent: 'planner',
         timestamp: Date.now(),
-        delegation: finalPlan,
+        planningRecommendation: finalPlan, // Changed from 'delegation' to 'planningRecommendation'
       },
     ],
   };
