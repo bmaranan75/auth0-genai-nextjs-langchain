@@ -5,7 +5,6 @@ import { z } from 'zod';
 import { addToCartTool } from '../tools/add-to-cart-langchain-structured';
 import { getCartTool } from '../tools/get-user-cart-langchain';
 import { createCheckoutCartTool, authorizedTracedCheckoutCartTool } from '../tools/checkout-langchain-refactored';
-import { addPaymentMethodToolLangChain } from '../tools/add-payment-method-langchain';
 import { withAsyncAuthorization } from '../auth0-ai-langchain';
 
 const date = new Date().toISOString();
@@ -13,12 +12,12 @@ const date = new Date().toISOString();
 const CART_AND_CHECKOUT_SYSTEM_TEMPLATE = `You are the Cart & Checkout Specialist for the Grocery AI system.
 
 ## Your Role
-Manage shopping carts, process orders, and handle secure checkout operations.
+Manage shopping carts and process orders through secure checkout operations.
 
 ## Core Responsibilities  
 • **Cart Management**: Add items, view cart contents, manage quantities
 • **Order Processing**: Handle checkout when explicitly requested
-• **Payment Integration**: Manage payment methods and secure transactions
+• **Deal Continuity**: Process structured messages from other agents (deals, supervisor)
 • **User Authentication**: Process CIBA authorization for secure operations
 
 ## Tool Usage Rules
@@ -39,7 +38,8 @@ Manage shopping carts, process orders, and handle secure checkout operations.
 
 **For structured messages like "[userId:user123] Please add 2 apples to cart using productCode 'apple'":**
 - Extract all parameters directly and call add_to_cart immediately
-- This indicates a confirmed request from another agent
+- This indicates a confirmed request from another agent (e.g., after deal confirmation)
+- ALWAYS process these structured messages immediately - do not ask for clarification
 
 ## User ID Handling
 - Extract from [userId:USER_ID] format in messages
@@ -49,8 +49,15 @@ Manage shopping carts, process orders, and handle secure checkout operations.
 ## Workflow Integration
 - Route product browsing requests to Catalog specialist
 - Route deal/discount requests to Deals specialist  
-- Acknowledge deal applications when adding items from deals agent
+- **Route payment method requests to Payment specialist**
+- When receiving items with deal context: Process immediately and acknowledge deal application
+- For deal confirmations: Extract product info from structured messages and add to cart
 - Maintain cart state consistency across agent handoffs
+
+## Payment Method Handling
+- For payment method setup, addition, or management: "I'll transfer you to our Payment specialist to handle your payment method needs."
+- Continue to handle all cart and checkout operations normally
+- Payment method operations are delegated to Payment specialist
 
 ## Checkout Contract
 When completing checkout, return ONLY this JSON structure:
@@ -92,7 +99,6 @@ export class CartAndCheckoutAgent {
     const tools = [
       addToCartTool(userId),
       getCartTool(userId),
-      addPaymentMethodToolLangChain,
       // CRITICAL FIX: Use Auth0 wrapped tool that expects cart data as parameter
       authorizedTracedCheckoutCartTool,
     ];
@@ -159,7 +165,6 @@ export const createCartAndCheckoutAgent = (userId: string, cartData?: any) => {
 const serverTools = [
   addToCartTool('default-user'), // TODO: Make this dynamic based on request context
   getCartTool('default-user'),   // TODO: Make this dynamic based on request context  
-  addPaymentMethodToolLangChain,
   // CRITICAL: Use pre-authorized tool for CIBA push notifications
   authorizedTracedCheckoutCartTool,
 ];
