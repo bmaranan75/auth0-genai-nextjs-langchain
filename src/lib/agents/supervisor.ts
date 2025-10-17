@@ -488,6 +488,58 @@ export function invalidateSupervisorLlmCacheByPrefix(prefix: string) {
   }
 }
 
+// Helper function to detect complex multi-step workflows
+function detectComplexWorkflow(messageContent: string): { isComplex: boolean; workflowType?: string; reason?: string } {
+  const lowerContent = messageContent.toLowerCase();
+  
+  // Pattern 1: "check/find deals + add to cart" type queries
+  const dealsAndCartPattern = (
+    (lowerContent.includes('check') || lowerContent.includes('find') || lowerContent.includes('look')) &&
+    (lowerContent.includes('deal') || lowerContent.includes('promotion') || lowerContent.includes('discount') || lowerContent.includes('sale')) &&
+    (lowerContent.includes('add') && lowerContent.includes('cart'))
+  );
+  
+  // Pattern 2: Conditional workflows with "if" statements
+  const conditionalPattern = (
+    lowerContent.includes('if') &&
+    (lowerContent.includes('deal') || lowerContent.includes('discount') || lowerContent.includes('sale') || lowerContent.includes('promotion')) &&
+    (lowerContent.includes('add') || lowerContent.includes('buy') || lowerContent.includes('purchase'))
+  );
+  
+  // Pattern 3: "and" connecting multiple actions
+  const multiActionPattern = (
+    lowerContent.includes(' and ') &&
+    ((lowerContent.includes('deal') || lowerContent.includes('promotion') || lowerContent.includes('discount')) &&
+     (lowerContent.includes('add') || lowerContent.includes('cart')))
+  );
+  
+  if (dealsAndCartPattern) {
+    return {
+      isComplex: true,
+      workflowType: 'deals_to_cart',
+      reason: 'User wants to check deals first, then add to cart based on availability'
+    };
+  }
+  
+  if (conditionalPattern) {
+    return {
+      isComplex: true,
+      workflowType: 'conditional_purchase',
+      reason: 'User wants conditional action based on deal availability'
+    };
+  }
+  
+  if (multiActionPattern) {
+    return {
+      isComplex: true,
+      workflowType: 'multi_step_purchase',
+      reason: 'User wants multiple coordinated actions (deals check + cart addition)'
+    };
+  }
+  
+  return { isComplex: false };
+}
+
 // Supervisor function to route requests
 async function supervisor(state: typeof SupervisorState.State) {
   const { messages, userId, conversationId, cartData, workflowContext, dealData, pendingProduct, plannerRecommendation } = state as any;
@@ -501,6 +553,10 @@ async function supervisor(state: typeof SupervisorState.State) {
   console.log(`[supervisor] Deal data available: ${!!dealData}`);
   console.log(`[supervisor] Pending product: ${!!pendingProduct}`);
   console.log(`[supervisor] Planner recommendation:`, plannerRecommendation);
+  
+  // Detect complex multi-step workflows
+  const complexWorkflow = detectComplexWorkflow(messageContent);
+  console.log(`[supervisor] Complex workflow detection:`, complexWorkflow);
   
   // FIRST: Handle planner recommendations with supervisor's delegation logic
   if (plannerRecommendation) {
@@ -546,6 +602,11 @@ async function supervisor(state: typeof SupervisorState.State) {
       } else if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
         console.log(`[supervisor] OVERRIDE: Context requires continuation flow analysis`);
         // Continue to regular flow for continuation analysis
+      } else if (complexWorkflow.isComplex && targetAgent === 'supervisor') {
+        // Handle complex multi-step workflows - start with deals agent
+        console.log(`[supervisor] COMPLEX WORKFLOW: Detected ${complexWorkflow.workflowType} - routing to deals agent first`);
+        console.log(`[supervisor] Reason: ${complexWorkflow.reason}`);
+        finalTargetAgent = 'deals';
       } else if (validAgents.includes(targetAgent) && confidence && confidence > 0.7) {
         // High confidence planner recommendation - use it
         console.log(`[supervisor] High confidence planner recommendation accepted: ${targetAgent}`);
@@ -700,20 +761,27 @@ User message: "${messageContent}"`);
   
   console.log(`[supervisor] Routing to agent: ${selectedAgent}`);
   
-  // Extract product information for deals routing (add-to-cart scenarios)
+  // Extract product information for deals routing (add-to-cart scenarios and complex workflows)
   let extractedProduct = pendingProduct;
-  if (selectedAgent === 'deals' && !pendingProduct) {
-  extractedProduct = await extractProductInfo(messageContent);
-    console.log('[supervisor] Extracted product info for deals:', extractedProduct);
+  if ((selectedAgent === 'deals' && !pendingProduct) || complexWorkflow.isComplex) {
+    extractedProduct = await extractProductInfo(messageContent);
+    console.log('[supervisor] Extracted product info for deals/complex workflow:', extractedProduct);
     // Invalidate planner cache if we just discovered a pending product — planner decisions may change
     try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+  }
+  
+  // Set appropriate workflow context for complex workflows
+  let finalWorkflowContext = workflowContext;
+  if (complexWorkflow.isComplex && selectedAgent === 'deals' && extractedProduct) {
+    finalWorkflowContext = 'check_deals';
+    console.log(`[supervisor] Setting check_deals context for complex workflow: ${complexWorkflow.workflowType}`);
   }
   
   return {
     next: selectedAgent,
     userId,
     conversationId,
-    workflowContext: selectedAgent === 'deals' && extractedProduct ? 'check_deals' : workflowContext,
+    workflowContext: finalWorkflowContext,
     pendingProduct: extractedProduct || pendingProduct,
     dealData,
     cartData,
@@ -790,13 +858,24 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     // Normalize product name for cart operations (deals use plural, cart uses singular)
     const productForCart = normalizeProductName(pendingProduct.product);
     
-    messageToAgent = `[userId:${userId}] User confirmed: "${originalContent}". Please add ${pendingProduct.quantity || 1} ${pendingProduct.product} to cart using productCode "${productForCart}" and userId "${userId}"`;
+    // Check if this is an automatic flow from complex workflow or manual confirmation
+    const isAutomaticFlow = dealData && dealData.applied && !actualUserContent.toLowerCase().includes('yes');
     
-    if (dealData) {
-      if (dealData.applied) {
-        messageToAgent += ` with the ${dealData.type || 'available'} deal applied`;
-      } else if (dealData.pending) {
-        messageToAgent += ` and apply the ${dealData.type || 'available'} deal that was offered`;
+    if (isAutomaticFlow) {
+      // Auto-proceeding from complex workflow with deals found
+      const originalUserIntent = dealData.originalIntent || actualUserContent;
+      messageToAgent = `[userId:${userId}] Complex workflow auto-proceeding: User requested "${originalUserIntent}" and deals were found. Please add ${pendingProduct.quantity || 1} ${pendingProduct.product} to cart using productCode "${productForCart}" and userId "${userId}" with the ${dealData.type || 'available'} deal applied automatically.`;
+      console.log('[cartAndCheckoutNode] Auto-proceeding with deal application for complex workflow');
+    } else {
+      // Manual confirmation flow
+      messageToAgent = `[userId:${userId}] User confirmed: "${originalContent}". Please add ${pendingProduct.quantity || 1} ${pendingProduct.product} to cart using productCode "${productForCart}" and userId "${userId}"`;
+      
+      if (dealData) {
+        if (dealData.applied) {
+          messageToAgent += ` with the ${dealData.type || 'available'} deal applied`;
+        } else if (dealData.pending) {
+          messageToAgent += ` and apply the ${dealData.type || 'available'} deal that was offered`;
+        }
       }
     }
     
@@ -991,7 +1070,20 @@ async function dealsNode(state: typeof SupervisorState.State) {
   }
 
   if (effectivePending && workflowContext === 'check_deals') {
-    messageToAgent = `User wants to add to cart: "${messageToAgent}". Check for deals on ${effectivePending.product}${effectivePending.quantity ? ` (quantity: ${effectivePending.quantity})` : ''}`;
+    // Detect if this is part of a complex workflow (deals + cart addition)
+    const originalMessage = messageToAgent.toLowerCase();
+    const isComplexWorkflow = (
+      (originalMessage.includes('check') && originalMessage.includes('deal') && originalMessage.includes('add')) ||
+      (originalMessage.includes('if') && originalMessage.includes('deal')) ||
+      (originalMessage.includes('deal') && originalMessage.includes('cart'))
+    );
+    
+    if (isComplexWorkflow) {
+      messageToAgent = `Complex workflow request: "${messageToAgent}". User wants to check for deals on ${effectivePending.product}${effectivePending.quantity ? ` (quantity: ${effectivePending.quantity})` : ''} and conditionally add to cart if deals are available. Please check for deals and present options clearly.`;
+      console.log('[dealsNode] Enhanced message for complex workflow');
+    } else {
+      messageToAgent = `User wants to add to cart: "${messageToAgent}". Check for deals on ${effectivePending.product}${effectivePending.quantity ? ` (quantity: ${effectivePending.quantity})` : ''}`;
+    }
   }
   
   const dealsContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'deals', messageToAgent);
@@ -1008,29 +1100,64 @@ async function dealsNode(state: typeof SupervisorState.State) {
                               responseContent.toLowerCase().includes('take advantage');
   
   if (requiresConfirmation) {
-    // Deal found, waiting for user confirmation
-    console.log('[dealsNode] Deal confirmation required, setting awaiting_deal_confirmation state');
-    console.log('[dealsNode] Pending product:', pendingProduct);
-    console.log('[dealsNode] Deal data will be:', { pending: true, response: responseContent });
+    // Deal found - check if this is a complex workflow that should auto-proceed
+    const originalMessage = messageToAgent.toLowerCase();
+    const isComplexWorkflow = (
+      (originalMessage.includes('check') && originalMessage.includes('deal') && originalMessage.includes('add')) ||
+      (originalMessage.includes('if') && originalMessage.includes('deal')) ||
+      (originalMessage.includes('deal') && originalMessage.includes('cart')) ||
+      (originalMessage.includes('complex workflow request'))
+    );
     
-    // Invalidate planner cache for this conversation/user since deal state changed (pending confirmation)
-    try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+    if (isComplexWorkflow) {
+      // For complex workflows, route back to supervisor with cart context
+      console.log('[dealsNode] Complex workflow with deals found - routing to supervisor for cart delegation');
+      console.log('[dealsNode] Pending product:', effectivePending || pendingProduct);
+      
+      // Invalidate planner cache for this conversation/user since dealData was applied/changed
+      try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
 
-    return {
-      messages: responseMessages,
-      workflowContext: 'awaiting_deal_confirmation',
-      dealData: { 
-        ...dealData, // Preserve existing deal data
-        pending: true, 
-        response: responseContent, 
-        type: 'product_deal' 
-      },
-      pendingProduct: effectivePending || pendingProduct,
-      cartData, // Preserve cart data
-      userId,
-      conversationId,
-      next: END,
-    };
+      return {
+        messages: responseMessages,
+        workflowContext: 'add_to_cart_with_deals',
+        dealData: { 
+          ...dealData, // Preserve existing deal data
+          applied: true, 
+          response: responseContent, 
+          type: 'product_deal',
+          originalIntent: messageToAgent // Preserve original user intent for cart context
+        },
+        pendingProduct: effectivePending || pendingProduct,
+        cartData, // Preserve cart data
+        userId,
+        conversationId,
+        next: 'supervisor', // Route back to supervisor for delegation
+      };
+    } else {
+      // For simple deal queries, require manual confirmation
+      console.log('[dealsNode] Simple deal query - requiring manual confirmation');
+      console.log('[dealsNode] Pending product:', pendingProduct);
+      console.log('[dealsNode] Deal data will be:', { pending: true, response: responseContent });
+      
+      // Invalidate planner cache for this conversation/user since deal state changed (pending confirmation)
+      try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
+      return {
+        messages: responseMessages,
+        workflowContext: 'awaiting_deal_confirmation',
+        dealData: { 
+          ...dealData, // Preserve existing deal data
+          pending: true, 
+          response: responseContent, 
+          type: 'product_deal' 
+        },
+        pendingProduct: effectivePending || pendingProduct,
+        cartData, // Preserve cart data
+        userId,
+        conversationId,
+        next: END,
+      };
+    }
   } else {
     // Check if this is a "no deals available" scenario
     const noDealsAvailable = responseContent.toLowerCase().includes('no current deals') ||
@@ -1294,7 +1421,6 @@ const workflow = new StateGraph(SupervisorState)
   })
   .addConditionalEdges('deals', (state) => state.next, {
     supervisor: 'supervisor',
-    cart_and_checkout: 'cart_and_checkout',
     [END]: END,
   })
   .addConditionalEdges('notification_agent', (state) => state.next, {

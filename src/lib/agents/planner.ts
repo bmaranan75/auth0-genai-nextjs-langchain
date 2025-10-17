@@ -105,6 +105,9 @@ KEY ANALYSIS PATTERNS:
 - Product search, finding items, browsing catalog → recommend catalog agent
 - Cart operations (add, view, remove items) → recommend supervisor for workflow management
 - Payment and billing → recommend payment agent
+- Complex multi-step queries combining deals + cart operations → recommend supervisor for orchestration
+- Conditional requests (e.g., "if there are deals, then add to cart") → recommend supervisor for workflow management
+- Requests involving multiple actions or decision points → recommend supervisor for multi-agent coordination
 
 ANALYSIS EXAMPLES:
 - "Hello" → RECOMMEND: direct_response (simple greeting)
@@ -122,6 +125,13 @@ ANALYSIS EXAMPLES:
 - "Complete my purchase" → RECOMMEND: delegate to supervisor (complex checkout process)
 - "Update my payment method" → RECOMMEND: delegate to payment (payment management)
 - "Send me order confirmation" → RECOMMEND: delegate to notification_agent (notifications)
+
+## Complex Multi-Step Workflow Examples:
+- "Can you check if there are deals for apples and if there is, add few to my cart" → RECOMMEND: delegate to supervisor (complex workflow: deals check + conditional cart addition)
+- "Check for deals on bananas and add them to my cart if there's a good deal" → RECOMMEND: delegate to supervisor (complex workflow: deals evaluation + conditional cart action)
+- "Look for discounts on milk and add 2 gallons if there are savings" → RECOMMEND: delegate to supervisor (complex workflow: discount check + conditional purchase)
+- "Find promotions on vegetables and add some to cart if the price is good" → RECOMMEND: delegate to supervisor (complex workflow: promotion search + conditional cart action)
+- "See if bread is on sale and add a loaf if it's discounted" → RECOMMEND: delegate to supervisor (complex workflow: sale check + conditional cart addition)
 
 REMEMBER: You provide analysis and recommendations only. All actual routing is handled by the supervisor.`,
   ],
