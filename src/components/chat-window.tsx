@@ -66,6 +66,7 @@ export function ChatWindow(props: {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<LangChainMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string>(''); // NEW: Single status indicator
   const [conversationId, setConversationId] = useState<string>(() => generateConversationId());
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -246,6 +247,7 @@ export function ChatWindow(props: {
     }
     
     try {
+      // Use EventSource for SSE streaming
       const response = await fetch(props.endpoint, {
         method: 'POST',
         headers: {
@@ -266,107 +268,259 @@ export function ChatWindow(props: {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const data = await response.json();
-      
-      // Handle authorization status if present
-      if (data.authorizationStatus) {
-        switch (data.authorizationStatus) {
-          case 'requested':
-            // Only add request message if we haven't already shown pending auth
-            setMessages(currentMessages => {
-              const hasPendingAuth = currentMessages.some(msg => 
-                msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
-              );
+      // Check if response is streaming (SSE)
+      const contentType = response.headers.get('content-type');
+      if (contentType?.includes('text/event-stream')) {
+        // Handle SSE streaming
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        
+        if (!reader) {
+          throw new Error('No reader available for stream');
+        }
+
+        let buffer = '';
+        let finalMessage = '';
+        let authStatus: any = undefined;
+        let authMessage: string | undefined = undefined;
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          
+          if (done) break;
+          
+          // Decode the chunk and add to buffer
+          buffer += decoder.decode(value, { stream: true });
+          
+          // Process complete SSE messages (separated by \n\n)
+          const messages = buffer.split('\n\n');
+          buffer = messages.pop() || ''; // Keep incomplete message in buffer
+          
+          for (const message of messages) {
+            if (!message.trim() || !message.startsWith('data: ')) continue;
+            
+            try {
+              const data = JSON.parse(message.slice(6)); // Remove 'data: ' prefix
               
-              if (!hasPendingAuth) {
-                const requestMessage: LangChainMessage = {
-                  id: `ephemeral-request-${Date.now()}`,
-                  role: 'system',
-                  content: `🔐 Authorization requested: ${data.authorizationMessage || 'Please check your device for approval'}`,
-                  isEphemeral: true,
-                  ephemeralType: 'authorization-request',
-                };
+              console.log('[ChatWindow] SSE event:', data);
+              
+              if (data.type === 'progress') {
+                // Update the single status indicator instead of adding chat messages
+                setStatusMessage(data.content);
                 
-                // Start polling for status updates after a delay
+                // Auto-clear after 5 seconds of no updates
                 setTimeout(() => {
+                  setStatusMessage(prev => prev === data.content ? '' : prev);
+                }, 5000);
+                
+              } else if (data.type === 'message') {
+                // Final message from agent
+                finalMessage = data.content;
+                authStatus = data.authorizationStatus;
+                authMessage = data.authorizationMessage;
+                
+              } else if (data.type === 'error') {
+                // Error message
+                finalMessage = data.content;
+                
+              } else if (data.type === 'done') {
+                // Stream completed
+                console.log('[ChatWindow] Stream completed');
+              }
+              
+            } catch (parseError) {
+              console.error('[ChatWindow] Error parsing SSE message:', parseError, message);
+            }
+          }
+        }
+        
+        // Clear the status message when stream is complete
+        setStatusMessage('');
+        
+        // Handle authorization status if present
+        if (authStatus) {
+          switch (authStatus) {
+            case 'requested':
+              setMessages(currentMessages => {
+                const hasPendingAuth = currentMessages.some(msg => 
+                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
+                );
+                
+                if (!hasPendingAuth) {
+                  const requestMessage: LangChainMessage = {
+                    id: `ephemeral-request-${Date.now()}`,
+                    role: 'system',
+                    content: `🔐 Authorization requested: ${authMessage || 'Please check your device for approval'}`,
+                    isEphemeral: true,
+                    ephemeralType: 'authorization-request',
+                  };
+                  
+                  setTimeout(() => {
+                    addEphemeralMessage('authorization-pending', 
+                      `⏳ Waiting for authorization approval...`);
+                    startAuthorizationPolling();
+                  }, 1000);
+                  
+                  return [...currentMessages, requestMessage];
+                } else {
+                  startAuthorizationPolling();
+                  return currentMessages;
+                }
+              });
+              break;
+            case 'pending':
+              setMessages(currentMessages => {
+                const hasExistingPending = currentMessages.some(msg => 
+                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
+                );
+                
+                if (!hasExistingPending) {
                   addEphemeralMessage('authorization-pending', 
                     `⏳ Waiting for authorization approval...`);
-                  startAuthorizationPolling();
-                }, 1000);
-                
-                return [...currentMessages, requestMessage];
-              } else {
-                // Just start polling since we already have pending message
+                }
                 startAuthorizationPolling();
                 return currentMessages;
+              });
+              break;
+            case 'approved':
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
               }
-            });
-            break;
-          case 'pending':
-            // Only add pending message if we don't already have one
-            setMessages(currentMessages => {
-              const hasExistingPending = currentMessages.some(msg => 
-                msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
-              );
-              
-              if (!hasExistingPending) {
-                addEphemeralMessage('authorization-pending', 
-                  `⏳ Waiting for authorization approval...`);
+              removePendingAuthMessages();
+              addEphemeralMessage('authorization-approved', 
+                `✅ Authorization approved! Processing your request...`);
+              break;
+            case 'denied':
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
               }
-              startAuthorizationPolling();
-              return currentMessages;
-            });
-            break;
-          case 'approved':
-            // Stop any polling
-            if (pollIntervalRef.current) {
-              clearInterval(pollIntervalRef.current);
-              pollIntervalRef.current = null;
-            }
-            // Remove any pending messages
-            removePendingAuthMessages();
-            addEphemeralMessage('authorization-approved', 
-              `✅ Authorization approved! Processing your request...`);
-            break;
-          case 'denied':
-            // Stop any polling
-            if (pollIntervalRef.current) {
-              clearInterval(pollIntervalRef.current);
-              pollIntervalRef.current = null;
-            }
-            // Remove any pending messages
-            removePendingAuthMessages();
-            addEphemeralMessage('authorization-denied', 
-              `❌ Authorization was denied.`);
-            break;
+              removePendingAuthMessages();
+              addEphemeralMessage('authorization-denied', 
+                `❌ Authorization was denied.`);
+              break;
+          }
         }
+        
+        // Add final assistant message
+        if (finalMessage) {
+          const assistantMessage: LangChainMessage = {
+            id: (Date.now() + 1).toString(),
+            role: 'assistant',
+            content: finalMessage,
+          };
+          
+          setMessages(prev => [...prev, assistantMessage]);
+        }
+        
+      } else {
+        // Fallback to non-streaming JSON response (backward compatibility)
+        const data = await response.json();
+      
+        // Handle authorization status if present
+        if (data.authorizationStatus) {
+          switch (data.authorizationStatus) {
+            case 'requested':
+              // Only add request message if we haven't already shown pending auth
+              setMessages(currentMessages => {
+                const hasPendingAuth = currentMessages.some(msg => 
+                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
+                );
+                
+                if (!hasPendingAuth) {
+                  const requestMessage: LangChainMessage = {
+                    id: `ephemeral-request-${Date.now()}`,
+                    role: 'system',
+                    content: `🔐 Authorization requested: ${data.authorizationMessage || 'Please check your device for approval'}`,
+                    isEphemeral: true,
+                    ephemeralType: 'authorization-request',
+                  };
+                  
+                  // Start polling for status updates after a delay
+                  setTimeout(() => {
+                    addEphemeralMessage('authorization-pending', 
+                      `⏳ Waiting for authorization approval...`);
+                    startAuthorizationPolling();
+                  }, 1000);
+                  
+                  return [...currentMessages, requestMessage];
+                } else {
+                  // Just start polling since we already have pending message
+                  startAuthorizationPolling();
+                  return currentMessages;
+                }
+              });
+              break;
+            case 'pending':
+              // Only add pending message if we don't already have one
+              setMessages(currentMessages => {
+                const hasExistingPending = currentMessages.some(msg => 
+                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
+                );
+                
+                if (!hasExistingPending) {
+                  addEphemeralMessage('authorization-pending', 
+                    `⏳ Waiting for authorization approval...`);
+                }
+                startAuthorizationPolling();
+                return currentMessages;
+              });
+              break;
+            case 'approved':
+              // Stop any polling
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+              }
+              // Remove any pending messages
+              removePendingAuthMessages();
+              addEphemeralMessage('authorization-approved', 
+                `✅ Authorization approved! Processing your request...`);
+              break;
+            case 'denied':
+              // Stop any polling
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+              }
+              // Remove any pending messages
+              removePendingAuthMessages();
+              addEphemeralMessage('authorization-denied', 
+                `❌ Authorization was denied.`);
+              break;
+          }
+        }
+        
+        // Add the response as an assistant message
+        const assistantMessage: LangChainMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: data.message || 'No response received',
+        };
+        
+        setMessages(prev => [...prev, assistantMessage]);
+        
+        // Scroll to bottom after adding assistant response
+        setTimeout(() => {
+          if (messagesEndRef.current) {
+            messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+          }
+        }, 150);
+        
+        // Clear completed authorization messages after successful response
+        // Give a short delay to let the user see the approved message before clearing
+        setTimeout(() => {
+          removeCompletedAuthMessages();
+        }, 3000);
       }
-      
-      // Add the response as an assistant message
-      const assistantMessage: LangChainMessage = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: data.message || 'No response received',
-      };
-      
-      setMessages(prev => [...prev, assistantMessage]);
-      
-      // Scroll to bottom after adding assistant response
-      setTimeout(() => {
-        if (messagesEndRef.current) {
-          messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-        }
-      }, 150);
-      
-      // Clear completed authorization messages after successful response
-      // Give a short delay to let the user see the approved message before clearing
-      setTimeout(() => {
-        removeCompletedAuthMessages();
-      }, 3000);
 
     } catch (error) {
       console.error('Error:', error);
       toast.error('Failed to get response');
+      
+      // Clear status message on error
+      setStatusMessage('');
       
       // Add error message
       const errorMessage: LangChainMessage = {
@@ -378,6 +532,8 @@ export function ChatWindow(props: {
       setMessages(prev => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
+      // Ensure status is cleared when loading stops
+      setStatusMessage('');
     }
   }
 
@@ -501,6 +657,24 @@ export function ChatWindow(props: {
       </div>
       
       <div className="sticky bottom-0 bg-background">
+        {/* Status Indicator - Single location for all progress updates */}
+        {statusMessage && (
+          <div className="max-w-[768px] mx-auto px-4 pb-2">
+            <div className={cn(
+              'rounded-lg px-4 py-3 border text-sm',
+              'bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800',
+              'text-blue-900 dark:text-blue-100',
+              'transition-all duration-300 ease-in-out',
+              'animate-in slide-in-from-bottom-2 fade-in'
+            )}>
+              <div className="flex items-center gap-2">
+                <LoaderCircle className="animate-spin h-4 w-4 flex-shrink-0" />
+                <span className="font-medium">{statusMessage}</span>
+              </div>
+            </div>
+          </div>
+        )}
+        
         <ChatInput
           value={input}
           onChange={handleInputChange}

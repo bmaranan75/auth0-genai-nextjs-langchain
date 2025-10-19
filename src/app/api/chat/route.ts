@@ -60,138 +60,172 @@ export async function POST(req: NextRequest) {
       // This uses the supervisor agent to route to specialized agents
       const agent = createAgent(userId ?? '', conversationId);
 
-      // Use the agent with proper Auth0 context and timeout handling  
-      const result = await Promise.race([
-        agent.invoke({
-          messages: [new HumanMessage(lastMessage.content)],
-          conversationId
-        }, {
-          configurable: {
-            cache,
-          },
-        }),
-        // Add timeout protection for Vercel
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Request timeout')), 55000) // 55s timeout
-        )
-      ]) as any; // Type assertion needed for Promise.race with different return types
+      // Use streaming for real-time progress updates
+      console.log("[chat-api] Starting streaming response for user:", userId);
       
-      console.log("[chat-api] Agent result:", JSON.stringify(result, null, 2));
-      
-      // Extract the response from the agent. Support nested AnnotatedMessage wrappers and plain AIMessage.
-      const rawResponse = result.messages && result.messages.length > 0 ? result.messages[result.messages.length - 1] : null;
-      console.log("[chat-api] Raw response message:", JSON.stringify(rawResponse, null, 2));
-      console.log("[chat-api] Number of result messages:", result.messages?.length || 0);
-
-      // Helper to recursively unwrap objects with a `.message` property until we reach the underlying message
-      function unwrapMessage(obj: any): any {
-        let cur = obj;
-        const seen = new Set<any>();
-        while (cur && typeof cur === 'object' && 'message' in cur && !seen.has(cur)) {
-          seen.add(cur);
-          cur = cur.message;
-        }
-        return cur;
-      }
-
-      const unwrapped = rawResponse ? unwrapMessage(rawResponse) : null;
-      // Try common fields for content
-      let responseContent: string | undefined = undefined;
-      if (unwrapped) {
-        if (typeof unwrapped === 'string') responseContent = unwrapped;
-        else if (unwrapped.content) responseContent = typeof unwrapped.content === 'string' ? unwrapped.content : String(unwrapped.content);
-        else if (unwrapped.text) responseContent = typeof unwrapped.text === 'string' ? unwrapped.text : String(unwrapped.text);
-      }
-
-      // Enhanced tool call extraction specifically for the planner's direct_response and generate_plan tools
-      function extractFromToolCalls(obj: any): string | undefined {
-        try {
-          const calls = obj?.additional_kwargs?.tool_calls || obj?.tool_calls || (obj?.message && (obj.message.additional_kwargs?.tool_calls || obj.message.tool_calls));
-          if (!calls || !Array.isArray(calls) || calls.length === 0) return undefined;
+      // Create a ReadableStream for SSE (Server-Sent Events)
+      const stream = new ReadableStream({
+        async start(controller) {
+          const encoder = new TextEncoder();
           
-          const first = calls[0];
-          console.log(`[chat-api] Processing tool call: ${first.name}`, first.args || first.arguments);
+          // Helper to send SSE data
+          const sendSSE = (data: any) => {
+            const message = `data: ${JSON.stringify(data)}\n\n`;
+            controller.enqueue(encoder.encode(message));
+          };
           
-          // Handle different tool call shapes
-          const args = first.args || first.arguments || first.function?.arguments || (first.function && first.function.arguments);
-          if (!args) return undefined;
-
-          // Handle stringified JSON arguments
-          let parsedArgs = args;
-          if (typeof args === 'string') {
-            try {
-              parsedArgs = JSON.parse(args);
-            } catch (_e) {
-              // If it's not JSON, treat as direct string
-              return args;
+          try {
+            // Use streaming API - SupervisorAgent.stream() returns an async iterator
+            const streamIterator = await agent.stream(lastMessage.content, conversationId);
+            
+            // Track all messages to get final response
+            let latestState: any = null;
+            let finalResponse = '';
+            
+            // Process stream events
+            for await (const chunk of streamIterator) {
+              console.log("[chat-api] Stream chunk keys:", Object.keys(chunk));
+              
+              // Store the latest state from the stream
+              latestState = chunk;
+              
+              // LangGraph streams emit chunks with node names as keys
+              // e.g., { supervisor: { messages: [...], next: 'catalog', ... } }
+              // Extract messages from any node in the chunk
+              for (const [nodeName, nodeOutput] of Object.entries(chunk)) {
+                if (nodeOutput && typeof nodeOutput === 'object') {
+                  const messages = (nodeOutput as any).messages;
+                  
+                  if (messages && Array.isArray(messages)) {
+                    console.log(`[chat-api] Node '${nodeName}' emitted ${messages.length} messages`);
+                    
+                    // Check each message for progress updates
+                    for (const msg of messages) {
+                      if (msg && msg.progress?.isProgressUpdate && msg.progress?.ephemeral) {
+                        // Send progress update to client
+                        const progressContent = typeof msg.message?.content === 'string' 
+                          ? msg.message.content 
+                          : String(msg.message?.content || '');
+                        
+                        sendSSE({
+                          type: 'progress',
+                          content: progressContent,
+                          agent: msg.agent || nodeName,
+                          timestamp: Date.now()
+                        });
+                        console.log("[chat-api] Sent progress update:", progressContent);
+                      }
+                    }
+                  }
+                }
+              }
             }
+            
+            // Extract final response after stream completes
+            console.log("[chat-api] Stream completed, extracting final response from latest state");
+            
+            if (latestState) {
+              // LangGraph stream chunks are keyed by node name
+              // Look through all nodes to find messages
+              let allMessages: any[] = [];
+              
+              for (const [nodeName, nodeOutput] of Object.entries(latestState)) {
+                if (nodeOutput && typeof nodeOutput === 'object') {
+                  const messages = (nodeOutput as any).messages;
+                  if (messages && Array.isArray(messages)) {
+                    console.log(`[chat-api] Found ${messages.length} messages from node '${nodeName}'`);
+                    allMessages = messages; // Use the last node's messages as the final state
+                  }
+                }
+              }
+              
+              if (allMessages.length > 0) {
+                // Get the last non-ephemeral, non-user message
+                const finalMessages = allMessages.filter((m: any) => {
+                  const isEphemeral = m.progress?.isProgressUpdate && m.progress?.ephemeral;
+                  const isUser = m.role === 'user';
+                  return !isEphemeral && !isUser;
+                });
+                
+                console.log("[chat-api] Filtered final messages count:", finalMessages.length);
+                
+                const lastMessage = finalMessages[finalMessages.length - 1];
+                
+                if (lastMessage) {
+                  console.log("[chat-api] Last message role:", lastMessage.role, "agent:", lastMessage.agent);
+                  
+                  // Handle AnnotatedMessage structure
+                  const unwrapped = lastMessage.message || lastMessage;
+                  
+                  // Extract content from various possible shapes
+                  if (typeof unwrapped === 'string') {
+                    finalResponse = unwrapped;
+                  } else if (typeof unwrapped.content === 'string') {
+                    finalResponse = unwrapped.content;
+                  } else if (unwrapped.content && Array.isArray(unwrapped.content)) {
+                    // Handle array content (some LangChain messages use this)
+                    finalResponse = unwrapped.content.map((c: any) => 
+                      typeof c === 'string' ? c : c.text || JSON.stringify(c)
+                    ).join('');
+                  } else if (unwrapped.text) {
+                    finalResponse = unwrapped.text;
+                  } else {
+                    finalResponse = String(unwrapped.content || unwrapped);
+                  }
+                  
+                  console.log("[chat-api] Extracted content:", finalResponse.substring(0, 100));
+                }
+              } else {
+                console.log("[chat-api] No messages found in latest state");
+              }
+            } else {
+              console.log("[chat-api] No latest state available");
+            }
+            
+            console.log("[chat-api] Final response extracted:", finalResponse);
+            
+            // Get authorization state after processing
+            const authState = getAuthorizationState();
+            
+            // Send final message
+            sendSSE({
+              type: 'message',
+              content: finalResponse || "I'm sorry, I couldn't process that request.",
+              authorizationStatus: authState.status !== 'idle' ? authState.status : undefined,
+              authorizationMessage: authState.message || undefined,
+              timestamp: Date.now()
+            });
+            
+            // Send done signal
+            sendSSE({ type: 'done' });
+            
+          } catch (error) {
+            console.error('[chat-api] Stream error:', error);
+            
+            // Send error to client
+            sendSSE({
+              type: 'error',
+              content: error instanceof Error && error.message === 'Request timeout'
+                ? "I apologize, but your request is taking longer than expected. Please try asking for something more specific or try again later."
+                : "I'm your shopping assistant! I can help you with product recommendations and shopping. What would you like to do today?",
+              timestamp: Date.now()
+            });
+            
+            sendSSE({ type: 'done' });
+          } finally {
+            controller.close();
           }
-
-          // Extract based on tool name for better accuracy
-          if (first.name === 'direct_response') {
-            return parsedArgs.answer || parsedArgs.content || parsedArgs.text;
-          } else if (first.name === 'generate_plan') {
-            // For generate_plan, return a user-friendly message since the actual planning happens in supervisor
-            const steps = parsedArgs.steps || [];
-            return `Let me help you with that. I'll need to look up some information to give you the best answer.`;
-          }
-
-          // Fallback extraction for other tool types
-          if (typeof parsedArgs === 'object') {
-            if (typeof parsedArgs.answer === 'string') return parsedArgs.answer;
-            if (typeof parsedArgs.content === 'string') return parsedArgs.content;
-            if (typeof parsedArgs.text === 'string') return parsedArgs.text;
-            // Last resort - stringify
-            return JSON.stringify(parsedArgs);
-          }
-          
-        } catch (err) {
-          console.warn('[chat-api] Error extracting tool_calls:', err);
         }
-        return undefined;
-      }
-
-      // First, try to get content directly from the message if it exists
-      if (!responseContent && unwrapped && unwrapped.content) {
-        responseContent = typeof unwrapped.content === 'string' ? unwrapped.content : String(unwrapped.content);
-        console.log("[chat-api] Found direct content:", responseContent);
-      }
-
-      // Try extraction from tool calls if no direct content
-      if (!responseContent && unwrapped) {
-        responseContent = extractFromToolCalls(unwrapped);
-      }
-
-      // Then try extraction from the top-level result
-      if (!responseContent && result) {
-        responseContent = extractFromToolCalls(result) || extractFromToolCalls(result.result) || extractFromToolCalls(result.content);
-      }
-
-      // Fallback: sometimes agent returns top-level `content` or `result.content`
-      if (!responseContent && result && (result.content || result.result?.content)) {
-        const fallback = result.content || result.result?.content;
-        responseContent = typeof fallback === 'string' ? fallback : String(fallback);
-      }
-
-      console.log("[chat-api] Raw agent response:", JSON.stringify(rawResponse || result, null, 2));
-      console.log("[chat-api] Unwrapped response content:", responseContent);
+      });
       
-      // Get authorization state after processing
-      const authState = getAuthorizationState();
-      
-      const response: any = {
-        message: responseContent || "I'm sorry, I couldn't process that request."
-      };
-
-      // Include authorization status if there was an authorization request
-      if (authState.status !== 'idle') {
-        response.authorizationStatus = authState.status;
-        if (authState.message) {
-          response.authorizationMessage = authState.message;
-        }
-      }
-      
-      return NextResponse.json(response, { headers });
+      // Return streaming response
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Connection': 'keep-alive',
+        },
+      });
       
     } catch (agentError) {
       console.error('Agent error:', agentError);
