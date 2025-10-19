@@ -82,6 +82,11 @@ export async function POST(req: NextRequest) {
             let latestState: any = null;
             let finalResponse = '';
             
+            // Track which progress messages have already been sent (by timestamp)
+            // This prevents sending duplicate progress updates when subsequent chunks
+            // contain the full message history
+            const sentProgressTimestamps = new Set<number>();
+            
             // Process stream events
             for await (const chunk of streamIterator) {
               console.log("[chat-api] Stream chunk keys:", Object.keys(chunk));
@@ -102,18 +107,26 @@ export async function POST(req: NextRequest) {
                     // Check each message for progress updates
                     for (const msg of messages) {
                       if (msg && msg.progress?.isProgressUpdate && msg.progress?.ephemeral) {
-                        // Send progress update to client
-                        const progressContent = typeof msg.message?.content === 'string' 
-                          ? msg.message.content 
-                          : String(msg.message?.content || '');
-                        
-                        sendSSE({
-                          type: 'progress',
-                          content: progressContent,
-                          agent: msg.agent || nodeName,
-                          timestamp: Date.now()
-                        });
-                        console.log("[chat-api] Sent progress update:", progressContent);
+                        // Only send if we haven't sent this message before (check by timestamp)
+                        if (!sentProgressTimestamps.has(msg.timestamp)) {
+                          // Send progress update to client
+                          const progressContent = typeof msg.message?.content === 'string' 
+                            ? msg.message.content 
+                            : String(msg.message?.content || '');
+                          
+                          sendSSE({
+                            type: 'progress',
+                            content: progressContent,
+                            agent: msg.agent || nodeName,
+                            timestamp: msg.timestamp
+                          });
+                          
+                          // Mark this message as sent
+                          sentProgressTimestamps.add(msg.timestamp);
+                          console.log("[chat-api] Sent progress update:", progressContent, "at", msg.timestamp);
+                        } else {
+                          console.log("[chat-api] Skipping duplicate progress update:", msg.message?.content);
+                        }
                       }
                     }
                   }
