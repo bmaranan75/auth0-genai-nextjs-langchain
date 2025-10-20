@@ -3,11 +3,12 @@
 import { useState, useEffect, useRef } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { toast } from 'sonner';
-import { ArrowUpIcon, LoaderCircle, MessageSquarePlus } from 'lucide-react';
+import { ArrowUpIcon, LoaderCircle, MessageSquarePlus, Code2 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { cn } from '@/utils/cn';
 import { generateConversationId } from '@/utils/conversation-id';
+import { DevMetadata, type MetadataEvent } from '@/components/dev-metadata';
 
 interface LangChainMessage {
   id: string;
@@ -67,10 +68,20 @@ export function ChatWindow(props: {
   const [messages, setMessages] = useState<LangChainMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string>(''); // NEW: Single status indicator
+  const [isAuthorizationPending, setIsAuthorizationPending] = useState(false); // NEW: Track auth state
   const [conversationId, setConversationId] = useState<string>(() => generateConversationId());
+  const [metadataEvents, setMetadataEvents] = useState<MetadataEvent[]>([]); // NEW: Dev metadata
+  const [showDevMetadata, setShowDevMetadata] = useState(false); // NEW: Toggle for dev panel
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isAuthorizationPendingRef = useRef(false); // Ref for closure-safe access
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+
+  // Helper to update authorization pending state and ref together
+  const updateAuthorizationPending = (pending: boolean) => {
+    setIsAuthorizationPending(pending);
+    isAuthorizationPendingRef.current = pending;
+  };
 
   // Function to add ephemeral messages as part of chat
   const addEphemeralMessage = (type: NonNullable<LangChainMessage['ephemeralType']>, content: string) => {
@@ -153,29 +164,37 @@ export function ChatWindow(props: {
       clearInterval(pollIntervalRef.current);
     }
     
+    // Set authorization pending flag and show status
+    updateAuthorizationPending(true);
+    setStatusMessage('⏳ Waiting for authorization approval...');
+    
     pollIntervalRef.current = setInterval(async () => {
       try {
         const response = await fetch('/api/auth-status');
         if (response.ok) {
           const data = await response.json();
+          
+          console.log('[ChatWindow] Auth status poll:', data.authorizationStatus);
+          
           if (data.authorizationStatus && data.authorizationStatus !== 'pending') {
-            // Stop polling
+            // Stop polling and clear authorization pending flag
+            updateAuthorizationPending(false);
             if (pollIntervalRef.current) {
               clearInterval(pollIntervalRef.current);
               pollIntervalRef.current = null;
             }
             
-            // Remove pending messages
-            removePendingAuthMessages();
-            
-            // Add status message
+            // Update status indicator
             if (data.authorizationStatus === 'approved') {
-              addEphemeralMessage('authorization-approved', 
-                `✅ Authorization approved! Processing your request...`);
+              setStatusMessage('✅ Authorization approved! Processing your request...');
+              setTimeout(() => setStatusMessage(''), 3000);
             } else if (data.authorizationStatus === 'denied') {
-              addEphemeralMessage('authorization-denied', 
-                `❌ Authorization was denied.`);
+              setStatusMessage('❌ Authorization was denied.');
+              setTimeout(() => setStatusMessage(''), 5000);
             }
+          } else if (data.authorizationStatus === 'pending') {
+            // Keep showing pending status
+            setStatusMessage('⏳ Waiting for authorization approval...');
           }
         }
       } catch (error) {
@@ -190,6 +209,7 @@ export function ChatWindow(props: {
     setConversationId(newConversationId);
     setMessages([]);
     setInput('');
+    setMetadataEvents([]); // Clear metadata for new conversation
     
     // Stop any ongoing polling
     if (pollIntervalRef.current) {
@@ -238,11 +258,12 @@ export function ChatWindow(props: {
     setInput('');
     setIsLoading(true);
     
-    // Show immediate authorization message if needed
+    // Show immediate authorization status if needed
     if (needsAuth) {
+      console.log('[ChatWindow] Authorization detected, showing status');
+      updateAuthorizationPending(true);
       setTimeout(() => {
-        addEphemeralMessage('authorization-pending', 
-          `🔐 Authorization request sent. Please check your device to approve the transaction...`);
+        setStatusMessage('🔐 Authorization request sent. Please check your device to approve the transaction...');
       }, 500); // Small delay to feel more natural
     }
     
@@ -304,14 +325,30 @@ export function ChatWindow(props: {
               
               console.log('[ChatWindow] SSE event:', data);
               
+              // Handle metadata events for dev tools
+              if (data.type === 'metadata' && data.payload) {
+                const metadataEvent: MetadataEvent = {
+                  id: `metadata-${Date.now()}-${Math.random()}`,
+                  timestamp: data.payload.timestamp || Date.now(),
+                  type: data.payload.type,
+                  data: data.payload.data
+                };
+                setMetadataEvents(prev => [...prev, metadataEvent]);
+                console.log('[ChatWindow] Added metadata event:', metadataEvent);
+              }
+              
               if (data.type === 'progress') {
-                // Update the single status indicator instead of adding chat messages
-                setStatusMessage(data.content);
-                
-                // Auto-clear after 5 seconds of no updates
-                setTimeout(() => {
-                  setStatusMessage(prev => prev === data.content ? '' : prev);
-                }, 5000);
+                // Only update status if authorization is NOT pending
+                if (!isAuthorizationPending) {
+                  setStatusMessage(data.content);
+                  
+                  // Auto-clear after 5 seconds of no updates
+                  setTimeout(() => {
+                    setStatusMessage(prev => prev === data.content ? '' : prev);
+                  }, 5000);
+                } else {
+                  console.log('[ChatWindow] Skipping progress update - authorization pending');
+                }
                 
               } else if (data.type === 'message') {
                 // Final message from agent
@@ -334,73 +371,46 @@ export function ChatWindow(props: {
           }
         }
         
-        // Clear the status message when stream is complete
-        setStatusMessage('');
-        
-        // Handle authorization status if present
+        // Handle authorization status if present (before clearing status)
         if (authStatus) {
           switch (authStatus) {
             case 'requested':
-              setMessages(currentMessages => {
-                const hasPendingAuth = currentMessages.some(msg => 
-                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
-                );
-                
-                if (!hasPendingAuth) {
-                  const requestMessage: LangChainMessage = {
-                    id: `ephemeral-request-${Date.now()}`,
-                    role: 'system',
-                    content: `🔐 Authorization requested: ${authMessage || 'Please check your device for approval'}`,
-                    isEphemeral: true,
-                    ephemeralType: 'authorization-request',
-                  };
-                  
-                  setTimeout(() => {
-                    addEphemeralMessage('authorization-pending', 
-                      `⏳ Waiting for authorization approval...`);
-                    startAuthorizationPolling();
-                  }, 1000);
-                  
-                  return [...currentMessages, requestMessage];
-                } else {
-                  startAuthorizationPolling();
-                  return currentMessages;
-                }
-              });
+              updateAuthorizationPending(true);
+              setStatusMessage(`🔐 Authorization requested: ${authMessage || 'Please check your device for approval'}`);
+              setTimeout(() => {
+                setStatusMessage('⏳ Waiting for authorization approval...');
+                startAuthorizationPolling();
+              }, 1000);
               break;
             case 'pending':
-              setMessages(currentMessages => {
-                const hasExistingPending = currentMessages.some(msg => 
-                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
-                );
-                
-                if (!hasExistingPending) {
-                  addEphemeralMessage('authorization-pending', 
-                    `⏳ Waiting for authorization approval...`);
-                }
-                startAuthorizationPolling();
-                return currentMessages;
-              });
+              updateAuthorizationPending(true);
+              setStatusMessage('⏳ Waiting for authorization approval...');
+              startAuthorizationPolling();
               break;
             case 'approved':
+              updateAuthorizationPending(false);
               if (pollIntervalRef.current) {
                 clearInterval(pollIntervalRef.current);
                 pollIntervalRef.current = null;
               }
-              removePendingAuthMessages();
-              addEphemeralMessage('authorization-approved', 
-                `✅ Authorization approved! Processing your request...`);
+              setStatusMessage('✅ Authorization approved! Processing your request...');
+              // Clear after 3 seconds
+              setTimeout(() => setStatusMessage(''), 3000);
               break;
             case 'denied':
+              updateAuthorizationPending(false);
               if (pollIntervalRef.current) {
                 clearInterval(pollIntervalRef.current);
                 pollIntervalRef.current = null;
               }
-              removePendingAuthMessages();
-              addEphemeralMessage('authorization-denied', 
-                `❌ Authorization was denied.`);
+              setStatusMessage('❌ Authorization was denied.');
+              // Clear after 5 seconds
+              setTimeout(() => setStatusMessage(''), 5000);
               break;
           }
+        } else {
+          // Only clear status if there's no authorization in progress
+          setStatusMessage('');
         }
         
         // Add final assistant message
@@ -422,72 +432,35 @@ export function ChatWindow(props: {
         if (data.authorizationStatus) {
           switch (data.authorizationStatus) {
             case 'requested':
-              // Only add request message if we haven't already shown pending auth
-              setMessages(currentMessages => {
-                const hasPendingAuth = currentMessages.some(msg => 
-                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
-                );
-                
-                if (!hasPendingAuth) {
-                  const requestMessage: LangChainMessage = {
-                    id: `ephemeral-request-${Date.now()}`,
-                    role: 'system',
-                    content: `🔐 Authorization requested: ${data.authorizationMessage || 'Please check your device for approval'}`,
-                    isEphemeral: true,
-                    ephemeralType: 'authorization-request',
-                  };
-                  
-                  // Start polling for status updates after a delay
-                  setTimeout(() => {
-                    addEphemeralMessage('authorization-pending', 
-                      `⏳ Waiting for authorization approval...`);
-                    startAuthorizationPolling();
-                  }, 1000);
-                  
-                  return [...currentMessages, requestMessage];
-                } else {
-                  // Just start polling since we already have pending message
-                  startAuthorizationPolling();
-                  return currentMessages;
-                }
-              });
+              updateAuthorizationPending(true);
+              setStatusMessage(`🔐 Authorization requested: ${data.authorizationMessage || 'Please check your device for approval'}`);
+              setTimeout(() => {
+                setStatusMessage('⏳ Waiting for authorization approval...');
+                startAuthorizationPolling();
+              }, 1000);
               break;
             case 'pending':
-              // Only add pending message if we don't already have one
-              setMessages(currentMessages => {
-                const hasExistingPending = currentMessages.some(msg => 
-                  msg.isEphemeral && msg.ephemeralType === 'authorization-pending'
-                );
-                
-                if (!hasExistingPending) {
-                  addEphemeralMessage('authorization-pending', 
-                    `⏳ Waiting for authorization approval...`);
-                }
-                startAuthorizationPolling();
-                return currentMessages;
-              });
+              updateAuthorizationPending(true);
+              setStatusMessage('⏳ Waiting for authorization approval...');
+              startAuthorizationPolling();
               break;
             case 'approved':
-              // Stop any polling
+              updateAuthorizationPending(false);
               if (pollIntervalRef.current) {
                 clearInterval(pollIntervalRef.current);
                 pollIntervalRef.current = null;
               }
-              // Remove any pending messages
-              removePendingAuthMessages();
-              addEphemeralMessage('authorization-approved', 
-                `✅ Authorization approved! Processing your request...`);
+              setStatusMessage('✅ Authorization approved! Processing your request...');
+              setTimeout(() => setStatusMessage(''), 3000);
               break;
             case 'denied':
-              // Stop any polling
+              updateAuthorizationPending(false);
               if (pollIntervalRef.current) {
                 clearInterval(pollIntervalRef.current);
                 pollIntervalRef.current = null;
               }
-              // Remove any pending messages
-              removePendingAuthMessages();
-              addEphemeralMessage('authorization-denied', 
-                `❌ Authorization was denied.`);
+              setStatusMessage('❌ Authorization was denied.');
+              setTimeout(() => setStatusMessage(''), 5000);
               break;
           }
         }
@@ -507,20 +480,15 @@ export function ChatWindow(props: {
             messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
           }
         }, 150);
-        
-        // Clear completed authorization messages after successful response
-        // Give a short delay to let the user see the approved message before clearing
-        setTimeout(() => {
-          removeCompletedAuthMessages();
-        }, 3000);
       }
 
     } catch (error) {
       console.error('Error:', error);
       toast.error('Failed to get response');
       
-      // Clear status message on error
+      // Clear status message and authorization pending flag on error
       setStatusMessage('');
+      updateAuthorizationPending(false);
       
       // Add error message
       const errorMessage: LangChainMessage = {
@@ -532,8 +500,10 @@ export function ChatWindow(props: {
       setMessages(prev => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
-      // Ensure status is cleared when loading stops
-      setStatusMessage('');
+      // Only clear status if not waiting for authorization
+      if (!isAuthorizationPendingRef.current) {
+        setStatusMessage('');
+      }
     }
   }
 
@@ -574,8 +544,26 @@ export function ChatWindow(props: {
 
   return (
     <div className="flex flex-col h-full">
-      {/* New Chat Button */}
-      <div className="flex justify-end p-4 pb-2 border-b border-gray-200 dark:border-gray-700">
+      {/* Header with New Chat and Dev Metadata buttons */}
+      <div className="flex justify-end items-center gap-2 p-4 pb-2 border-b border-gray-200 dark:border-gray-700">
+        <Button
+          onClick={() => setShowDevMetadata(!showDevMetadata)}
+          variant="outline"
+          size="sm"
+          className={cn(
+            "flex items-center gap-2 text-sm transition-colors",
+            showDevMetadata && "bg-purple-100 dark:bg-purple-900/30 border-purple-300 dark:border-purple-700"
+          )}
+          disabled={isLoading}
+        >
+          <Code2 className="h-4 w-4" />
+          Dev Metadata
+          {metadataEvents.length > 0 && (
+            <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-purple-500 text-white">
+              {metadataEvents.length}
+            </span>
+          )}
+        </Button>
         <Button
           onClick={startNewChat}
           variant="outline"
@@ -588,7 +576,14 @@ export function ChatWindow(props: {
         </Button>
       </div>
       
-      <div className="flex-1 overflow-auto p-4" id="chat-container" ref={chatContainerRef}>
+      {/* Main content area with optional dev panel */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Chat area */}
+        <div className={cn(
+          "flex-1 flex flex-col transition-all duration-300",
+          showDevMetadata ? "mr-2" : ""
+        )}>
+          <div className="flex-1 overflow-auto p-4" id="chat-container" ref={chatContainerRef}>
         {messages.length === 0 ? (
           <div>{props.emptyStateComponent}</div>
         ) : (
@@ -682,6 +677,29 @@ export function ChatWindow(props: {
           loading={isLoading}
           placeholder={props.placeholder ?? 'What can I help you with?'}
         />
+      </div>
+    </div>
+    
+        {/* Dev Metadata Panel - Slide in from right */}
+        <div className={cn(
+          "flex-shrink-0 border-l border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50",
+          "transition-all duration-300 ease-in-out overflow-hidden",
+          showDevMetadata ? "w-96" : "w-0"
+        )}>
+          {showDevMetadata && (
+            <div className="h-full flex flex-col">
+              <div className="p-4 border-b border-gray-200 dark:border-gray-700">
+                <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                  Agent Workflow Metadata
+                </h3>
+                <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
+                  Track planner recommendations and supervisor routing decisions
+                </p>
+              </div>
+              <DevMetadata events={metadataEvents} className="flex-1" />
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

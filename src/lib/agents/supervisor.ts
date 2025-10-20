@@ -57,8 +57,9 @@ export const routePlanner = (state: typeof SupervisorState.State) => {
 
   console.log("[routePlanner] Processing planner response:", JSON.stringify(lastMessage, null, 2));
 
-  // CRITICAL CHANGE: Planner now only provides recommendations, not executable delegations
-  // ALL routing decisions are made by the supervisor to enforce separation of concerns
+  // CRITICAL CHANGE: Planner provides routing recommendations
+  // - direct_response: End workflow immediately with planner's response
+  // - delegate: Route to supervisor for agent delegation
   
   // Check if this is a planner recommendation
   if (lastMessage && (lastMessage.planningRecommendation || lastMessage.delegation)) {
@@ -66,17 +67,37 @@ export const routePlanner = (state: typeof SupervisorState.State) => {
     
     console.log(`[routePlanner] Received planner recommendation:`, recommendation);
     
-    // Store the recommendation in state for supervisor to use, but ALWAYS route to supervisor
-    try {
-      (state as any).plannerRecommendation = recommendation;
-      (state as any).delegationDepth = (delegationDepth as number) + 1;
-      console.log(`[routePlanner] Stored recommendation and incremented delegationDepth → ${(state as any).delegationDepth}`);
-    } catch (e) {
-      console.warn('[routePlanner] Could not store recommendation on state', e);
+    // Handle direct_response: Return the response immediately without supervisor
+    if (recommendation.action === 'direct_response') {
+      console.log('[routePlanner] Direct response action - ending workflow immediately');
+      console.log('[routePlanner] Response:', recommendation.task || recommendation.reasoning);
+      
+      // Update the last message with the direct response content
+      if (lastMessage.message && recommendation.task) {
+        lastMessage.message.content = recommendation.task;
+      }
+      
+      return END;
     }
     
-    // ALWAYS route to supervisor - it will make the actual delegation decision
-    console.log('[routePlanner] Routing to supervisor for delegation decision');
+    // Handle delegate: Route to supervisor for agent delegation decision
+    if (recommendation.action === 'delegate') {
+      console.log('[routePlanner] Delegate action - routing to supervisor');
+      
+      // Store the recommendation in state for supervisor to use
+      try {
+        (state as any).plannerRecommendation = recommendation;
+        (state as any).delegationDepth = (delegationDepth as number) + 1;
+        console.log(`[routePlanner] Stored recommendation and incremented delegationDepth → ${(state as any).delegationDepth}`);
+      } catch (e) {
+        console.warn('[routePlanner] Could not store recommendation on state', e);
+      }
+      
+      return 'supervisor';
+    }
+    
+    // Unknown action - default to supervisor for safety
+    console.warn('[routePlanner] Unknown action type:', recommendation.action, '- routing to supervisor');
     return 'supervisor';
   }
 
@@ -713,6 +734,57 @@ async function supervisor(state: typeof SupervisorState.State) {
   console.log(`[supervisor] Pending product: ${!!pendingProduct}`);
   console.log(`[supervisor] Planner recommendation:`, plannerRecommendation);
   
+  // CRITICAL: Check for workflow context continuations BEFORE planner logic
+  // The planner doesn't have visibility into workflowContext, so we must handle it here first
+  if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
+    console.log(`[supervisor] EARLY CHECK: Detected awaiting_deal_confirmation context, checking for affirmative response`);
+    // Robust affirmative detection
+    const messageWords = messageContent.toLowerCase().trim().split(/\s+/);
+    const affirmativePatterns = [
+      'yes', 'sure', 'ok', 'okay', 'apply', 'take', 
+      'sounds', 'great', 'perfect', 'good', 'deal', 'go'
+    ];
+    
+    const hasAffirmative = affirmativePatterns.some(pattern => 
+      messageWords.some((word: string) => word.includes(pattern) || pattern.includes(word))
+    );
+    
+    if (hasAffirmative) {
+      console.log(`[supervisor] EARLY CHECK: Affirmative response detected, routing to cart_and_checkout with add_to_cart_with_deals context`);
+      const cartProgressMessage = getAgentProgressMessage('cart_and_checkout', 'add_to_cart_with_deals');
+      cartProgressMessage.timestamp = Date.now() + timestampOffset++;
+      return {
+        next: 'cart_and_checkout',
+        userId,
+        conversationId,
+        workflowContext: 'add_to_cart_with_deals',
+        dealData,
+        pendingProduct,
+        cartData,
+        messages: [...initialMessages, cartProgressMessage, lastAnnotated]
+      };
+    } else {
+      // Negative or unclear response - user declined the deal
+      console.log(`[supervisor] EARLY CHECK: Non-affirmative response detected, ending workflow`);
+      const declineMessage = new AIMessage("No problem! Let me know if you'd like to explore other products or if there's anything else I can help you with.");
+      return {
+        messages: [...initialMessages, {
+          message: declineMessage,
+          role: 'assistant',
+          agent: 'supervisor',
+          timestamp: Date.now()
+        }],
+        userId,
+        conversationId,
+        workflowContext: undefined, // Clear context
+        dealData: undefined,         // Clear deal data
+        pendingProduct: undefined,    // Clear pending product
+        cartData,
+        next: END
+      };
+    }
+  }
+  
   // Detect complex multi-step workflows
   const complexWorkflow = detectComplexWorkflow(messageContent);
   console.log(`[supervisor] Complex workflow detection:`, complexWorkflow);
@@ -726,7 +798,9 @@ async function supervisor(state: typeof SupervisorState.State) {
     if (action === 'direct_response') {
       console.log(`[supervisor] Planner recommends direct response: ${reasoning}`);
       // For direct responses, we can return immediately without agent delegation
-      const directResponse = new AIMessage(reasoning || 'I can help you with that.');
+      // Use the planner's task or reasoning as the response content
+      const responseContent = plannerRecommendation.task || reasoning || 'Hello! How can I help you today?';
+      const directResponse = new AIMessage(responseContent);
       return {
         messages: [...initialMessages, {
           message: directResponse,
@@ -867,34 +941,7 @@ async function supervisor(state: typeof SupervisorState.State) {
     };
   }
   
-  if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
-    console.log(`[supervisor] OVERRIDE: Detected awaiting_deal_confirmation context, checking for affirmative response`);
-    // Robust affirmative detection as fallback
-    const messageWords = messageContent.toLowerCase().trim().split(/\s+/);
-    const affirmativePatterns = [
-      'yes', 'sure', 'ok', 'okay', 'apply', 'take', 
-      'sounds', 'great', 'perfect', 'good', 'deal', 'go'
-    ];
-    
-    const hasAffirmative = affirmativePatterns.some(pattern => 
-      messageWords.some((word: string) => word.includes(pattern) || pattern.includes(word))
-    );
-    
-    if (hasAffirmative) {
-      console.log(`[supervisor] OVERRIDE: Affirmative response detected, routing to cart_and_checkout with add_to_cart_with_deals context`);
-      const cartProgressMessage = getAgentProgressMessage('cart_and_checkout', 'add_to_cart_with_deals');
-      cartProgressMessage.timestamp = Date.now() + timestampOffset++;
-      return {
-        next: 'cart_and_checkout',
-        userId,
-        conversationId,
-        workflowContext: 'add_to_cart_with_deals',
-        dealData,
-        pendingProduct,
-        messages: [...initialMessages, cartProgressMessage, lastAnnotated]
-      };
-    }
-  }
+  // Note: awaiting_deal_confirmation is now handled by EARLY CHECK above (before planner logic)
   
   // Enhanced routing with context awareness - fallback only when continuation fails
   console.log(`[supervisor] No high-confidence continuation detected (confidence: ${continuationAnalysis.confidence})`);
@@ -903,17 +950,29 @@ async function supervisor(state: typeof SupervisorState.State) {
   const systemMessage = new SystemMessage(`You are an intelligent supervisor routing customer requests in a grocery shopping system.
 
 Available agents:
-• **catalog** - Product discovery, search, browsing, recommendations
-• **cart_and_checkout** - Cart operations, checkout, order completion  
+• **catalog** - Product discovery, search, browsing, recommendations (NO deals/promotions)
+• **cart_and_checkout** - Adds items to cart (AFTER deals are checked), checkout, order completion
 • **payment** - Payment method management only
-• **deals** - Deal discovery and application
+• **deals** - Deal discovery, promotions, discounts, sales, special offers
 
-Context awareness rules:
-- For new product inquiries → catalog
-- For cart actions (add/remove/view) → deals first (to check offers), then cart_and_checkout
-- For checkout/purchase → cart_and_checkout
-- For payment setup → payment
+Routing Rules:
+- For ANY "add to cart" request → **deals** (to check for offers first)
+- For completing checkout/purchase → **cart_and_checkout**
+- For adding an item to the cart AFTER a deal has been offered/accepted → **cart_and_checkout**
+- For product search/browsing WITHOUT deals → **catalog**
+- For ANY mention of deals, discounts, promotions, sales → **deals**
+- For payment setup → **payment**
 - For ambiguous requests → use conversation context to infer intent
+
+Complex Workflow Rule:
+- If user asks to "add to cart" AND "apply deals" (or similar) → **deals** (this starts an automatic workflow)
+- If user asks to "check deals" AND "add to cart" in the same request → **deals** (this starts an automatic workflow)
+
+IMPORTANT: 
+- If user wants to add an item to the cart → ALWAYS route to **deals** agent first.
+- If user mentions "deals", "promotions", "discounts", "sales", "offers" → ALWAYS route to **deals** agent.
+- If user just wants product info (price, description) without deals → route to **catalog**.
+- Catalog agent does NOT handle deal-related queries.
 
 CRITICAL: If there's ANY indication this is a continuation or response to a previous interaction:
 - Check workflow context carefully
@@ -987,6 +1046,14 @@ async function catalogNode(state: typeof SupervisorState.State) {
 
   // Annotate returned messages as coming from the catalog assistant
   const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'catalog'));
+
+  // Log routing decision for debugging
+  console.log('[catalogNode] ROUTING DECISION:', {
+    fromAgent: 'catalog',
+    toAgent: END,
+    reason: 'Task completed',
+    state: { workflowContext, pendingProduct: !!pendingProduct, dealData: !!dealData }
+  });
 
   return {
     messages: annotatedResponses,
@@ -1161,6 +1228,15 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
       // Invalidate planner cache - cart was cleared after checkout
       try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
 
+      // Log routing decision for debugging
+      console.log('[cartAndCheckoutNode] ROUTING DECISION:', {
+        fromAgent: 'cart_and_checkout',
+        toAgent: 'notification_agent',
+        reason: 'Structured checkout success - routing to notification',
+        orderId: structured.orderId,
+        state: { workflowContext: null, pendingProduct: null, cartData: null }
+      });
+
       return {
         messages: annotatedResponses,
         userId,
@@ -1177,6 +1253,15 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     if (structured.checkoutStatus === 'failure') {
       console.log('[cartAndCheckoutNode] Structured checkout failure detected');
       const failMessage = new AIMessage(`Checkout failed: ${structured.summary || 'Unknown reason'}`);
+      
+      // Log routing decision for debugging
+      console.log('[cartAndCheckoutNode] ROUTING DECISION:', {
+        fromAgent: 'cart_and_checkout',
+        toAgent: END,
+        reason: 'Checkout failure - ending workflow',
+        state: { workflowContext: null, pendingProduct: null, cartData: 'preserved' }
+      });
+      
       return {
         messages: annotatedResponses ? [...annotatedResponses, annotateMessage(failMessage, 'assistant', 'cart_and_checkout')] : [annotateMessage(failMessage, 'assistant', 'cart_and_checkout')],
         userId,
@@ -1212,6 +1297,14 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     // Invalidate planner cache - cart was cleared after checkout
     try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
 
+    // Log routing decision for debugging
+    console.log('[cartAndCheckoutNode] ROUTING DECISION:', {
+      fromAgent: 'cart_and_checkout',
+      toAgent: 'notification_agent',
+      reason: 'Checkout success (text fallback) - routing to notification',
+      state: { workflowContext: null, pendingProduct: null, cartData: null }
+    });
+
     return {
       messages: annotatedResponses,
       userId,
@@ -1224,6 +1317,14 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
       next: 'notification_agent'
     };
   }
+
+  // Log routing decision for debugging
+  console.log('[cartAndCheckoutNode] ROUTING DECISION:', {
+    fromAgent: 'cart_and_checkout',
+    toAgent: END,
+    reason: 'Cart operation completed - ending workflow',
+    state: { workflowContext, pendingProduct: !!pendingProduct, dealData: !!dealData, cartData: !!cartData }
+  });
 
   return {
     messages: annotatedResponses,
@@ -1295,6 +1396,15 @@ async function dealsNode(state: typeof SupervisorState.State) {
     const errorMessage = new AIMessage(
       "I need to know which product you're interested in to check for deals. Could you please specify the product name? For example, 'Check deals on apples' or 'Add 8 apples to my cart'."
     );
+    
+    // Log routing decision for debugging
+    console.log('[dealsNode] ROUTING DECISION:', {
+      fromAgent: 'deals',
+      toAgent: END,
+      reason: 'No product information available - ending workflow',
+      state: { workflowContext: null, pendingProduct: null }
+    });
+    
     return {
       messages: [annotateMessage(errorMessage, 'assistant', 'deals')],
       userId,
@@ -1389,6 +1499,18 @@ async function dealsNode(state: typeof SupervisorState.State) {
         createProgressMessage('🛒 Adding items to your cart...', 'supervisor')
       ];
 
+      // Log routing decision for debugging
+      console.log('[dealsNode] ROUTING DECISION:', {
+        fromAgent: 'deals',
+        toAgent: 'supervisor',
+        reason: 'Auto-apply intent - routing to supervisor for cart delegation',
+        state: { 
+          workflowContext: 'add_to_cart_with_deals', 
+          pendingProduct: effectivePending || pendingProduct,
+          dealData: { applied: true, type: 'product_deal' }
+        }
+      });
+
       return {
         messages: messagesWithProgress,
         workflowContext: 'add_to_cart_with_deals',
@@ -1414,6 +1536,18 @@ async function dealsNode(state: typeof SupervisorState.State) {
       // Invalidate planner cache for this conversation/user since deal state changed (pending confirmation)
       try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
 
+      // Log routing decision for debugging
+      console.log('[dealsNode] ROUTING DECISION:', {
+        fromAgent: 'deals',
+        toAgent: END,
+        reason: 'Manual confirmation required - ending workflow',
+        state: { 
+          workflowContext: 'awaiting_deal_confirmation', 
+          pendingProduct: effectivePending || pendingProduct,
+          dealData: { pending: true, type: 'product_deal' }
+        }
+      });
+
       return {
         messages: responseMessages,
         workflowContext: 'awaiting_deal_confirmation',
@@ -1435,6 +1569,18 @@ async function dealsNode(state: typeof SupervisorState.State) {
       
       // Invalidate planner cache for this conversation/user since dealData was applied/changed
       try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
+      // Log routing decision for debugging
+      console.log('[dealsNode] ROUTING DECISION:', {
+        fromAgent: 'deals',
+        toAgent: 'cart_and_checkout',
+        reason: 'Deal found without confirmation - direct to cart',
+        state: { 
+          workflowContext: 'add_to_cart_with_deals', 
+          pendingProduct: effectivePending,
+          dealData: { applied: true, type: 'product_deal' }
+        }
+      });
 
       return {
         messages: responseMessages,
@@ -1464,6 +1610,18 @@ async function dealsNode(state: typeof SupervisorState.State) {
       console.log('[dealsNode] No deals available, ending workflow to allow user choice');
       // Invalidate planner cache for this conversation/user since dealData was updated
       try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+
+      // Log routing decision for debugging
+      console.log('[dealsNode] ROUTING DECISION:', {
+        fromAgent: 'deals',
+        toAgent: END,
+        reason: 'No deals available - ending workflow',
+        state: { 
+          workflowContext: null, 
+          pendingProduct: null,
+          dealData: { applied: false, type: 'no_deals_found' }
+        }
+      });
 
       return {
         messages: responseMessages,
@@ -1498,6 +1656,14 @@ async function paymentNode(state: typeof SupervisorState.State) {
   const paymentContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'payment', messageContent);
   const result = await callLangGraphAgent({ agentId: 'payment', message: paymentContext, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
   const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'payment'));
+  
+  // Log routing decision for debugging
+  console.log('[paymentNode] ROUTING DECISION:', {
+    fromAgent: 'payment',
+    toAgent: END,
+    reason: 'Payment operation completed',
+    state: { workflowContext, pendingProduct: !!pendingProduct, dealData: !!dealData, cartData: !!cartData }
+  });
   
   return {
     messages: annotatedResponses,
@@ -1582,6 +1748,15 @@ async function notificationAgent(state: typeof SupervisorState.State) {
   
   if (!notificationData) {
     console.log('[notificationAgent] No notificationData present - nothing to send');
+    
+    // Log routing decision for debugging
+    console.log('[notificationAgent] ROUTING DECISION:', {
+      fromAgent: 'notification_agent',
+      toAgent: END,
+      reason: 'No notification data - ending workflow',
+      state: { workflowContext: null, notificationData: null }
+    });
+    
     return {
       messages: [notificationProgressMessage, annotateMessage(new AIMessage('No notification to send.'), 'assistant', 'notification_agent')],
       userId,
@@ -1600,6 +1775,14 @@ async function notificationAgent(state: typeof SupervisorState.State) {
   const feedbackMessage = sendResult.ok
     ? new AIMessage('Notification sent successfully.')
     : new AIMessage(`Failed to send notification: ${sendResult.error || JSON.stringify(sendResult.result)}`);
+
+  // Log routing decision for debugging
+  console.log('[notificationAgent] ROUTING DECISION:', {
+    fromAgent: 'notification_agent',
+    toAgent: END,
+    reason: sendResult.ok ? 'Notification sent successfully' : 'Notification send failed',
+    state: { workflowContext: null, notificationData: null }
+  });
 
   return {
     // Return the feedback message first so callers/tests that inspect the first

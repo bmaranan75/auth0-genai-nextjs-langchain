@@ -87,12 +87,69 @@ export async function POST(req: NextRequest) {
             // contain the full message history
             const sentProgressTimestamps = new Set<number>();
             
+            // Track workflow context to only emit metadata when it changes
+            let previousWorkflowContext: string | null = null;
+            
             // Process stream events
             for await (const chunk of streamIterator) {
               console.log("[chat-api] Stream chunk keys:", Object.keys(chunk));
               
               // Store the latest state from the stream
               latestState = chunk;
+              
+              // Extract metadata for dev tools
+              for (const [nodeName, nodeOutput] of Object.entries(chunk)) {
+                if (nodeOutput && typeof nodeOutput === 'object') {
+                  // Check for planner recommendation
+                  if ((nodeOutput as any).plannerRecommendation) {
+                    sendSSE({
+                      type: 'metadata',
+                      payload: {
+                        type: 'planner_recommendation',
+                        data: (nodeOutput as any).plannerRecommendation,
+                        timestamp: Date.now()
+                      }
+                    });
+                  }
+                  
+                  // Check for supervisor decision (routing)
+                  if ((nodeOutput as any).next && (nodeOutput as any).next !== '__end__') {
+                    sendSSE({
+                      type: 'metadata',
+                      payload: {
+                        type: 'supervisor_decision',
+                        data: {
+                          targetAgent: (nodeOutput as any).next,
+                          workflowContext: (nodeOutput as any).workflowContext,
+                          dealData: (nodeOutput as any).dealData ? 'present' : null,
+                          pendingProduct: (nodeOutput as any).pendingProduct ? 'present' : null,
+                          cartData: (nodeOutput as any).cartData ? 'present' : null
+                        },
+                        timestamp: Date.now()
+                      }
+                    });
+                  }
+                  
+                  // Check for workflow context changes - ONLY emit if it changed
+                  const currentWorkflowContext = (nodeOutput as any).workflowContext;
+                  if (currentWorkflowContext && currentWorkflowContext !== previousWorkflowContext) {
+                    sendSSE({
+                      type: 'metadata',
+                      payload: {
+                        type: 'workflow_context',
+                        data: {
+                          context: currentWorkflowContext,
+                          dealData: (nodeOutput as any).dealData ? 'present' : null,
+                          pendingProduct: (nodeOutput as any).pendingProduct ? 'present' : null
+                        },
+                        timestamp: Date.now()
+                      }
+                    });
+                    previousWorkflowContext = currentWorkflowContext;
+                    console.log(`[chat-api] Workflow context changed to: ${currentWorkflowContext}`);
+                  }
+                }
+              }
               
               // LangGraph streams emit chunks with node names as keys
               // e.g., { supervisor: { messages: [...], next: 'catalog', ... } }

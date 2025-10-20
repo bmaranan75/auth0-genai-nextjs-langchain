@@ -72,6 +72,9 @@ export async function POST(req: NextRequest) {
     const responseStream = new ReadableStream({
       async start(controller) {
         // Helper: attempt to extract human-readable strings from complex agent state objects
+          // Track workflow context to only emit when it changes
+          let previousWorkflowContext: string | null = null;
+          
           // Helper: detect plan-like (planner/supervisor) recommendation shapes
           function isPlanLike(value: any): boolean {
             try {
@@ -88,6 +91,117 @@ export async function POST(req: NextRequest) {
               // ignore
             }
             return false;
+          }
+
+          // Helper: extract metadata from chunk for dev tools
+          function extractMetadata(chunk: any, prevContext: string | null): { metadata: any | null, newContext: string | null } {
+            try {
+              if (!chunk || typeof chunk !== 'object') return { metadata: null, newContext: prevContext };
+              
+              let newContext = prevContext;
+              
+              // Check for planner recommendation
+              if (chunk.plannerRecommendation || chunk.planningRecommendation) {
+                return {
+                  metadata: {
+                    type: 'planner_recommendation',
+                    data: chunk.plannerRecommendation || chunk.planningRecommendation,
+                    timestamp: Date.now()
+                  },
+                  newContext
+                };
+              }
+              
+              // Check for agent routing decision (from specialized agents)
+              // This captures when an agent decides where to route next
+              if (chunk.next && chunk.next !== '__end__' && chunk.messages && Array.isArray(chunk.messages) && chunk.messages.length > 0) {
+                const lastMsg = chunk.messages[chunk.messages.length - 1];
+                // Detect if this is from a specialized agent (not supervisor, not planner)
+                const fromAgent = lastMsg.agent;
+                if (fromAgent && fromAgent !== 'supervisor' && fromAgent !== 'user' && fromAgent !== 'planner') {
+                  return {
+                    metadata: {
+                      type: 'agent_routing_decision',
+                      data: {
+                        fromAgent: fromAgent,
+                        toAgent: chunk.next,
+                        workflowContext: chunk.workflowContext,
+                        dealData: chunk.dealData ? {
+                          applied: chunk.dealData.applied,
+                          pending: chunk.dealData.pending,
+                          type: chunk.dealData.type
+                        } : null,
+                        pendingProduct: chunk.pendingProduct ? {
+                          product: chunk.pendingProduct.product,
+                          quantity: chunk.pendingProduct.quantity
+                        } : null,
+                        cartData: chunk.cartData ? 'present' : null
+                      },
+                      timestamp: Date.now()
+                    },
+                    newContext
+                  };
+                }
+              }
+              
+              // Check for supervisor decision/routing
+              if (chunk.next && chunk.next !== '__end__' && (chunk.supervisor || chunk.agent === 'supervisor')) {
+                return {
+                  metadata: {
+                    type: 'supervisor_decision',
+                    data: {
+                      targetAgent: chunk.next,
+                      workflowContext: chunk.workflowContext,
+                      dealData: chunk.dealData ? 'present' : null,
+                      pendingProduct: chunk.pendingProduct ? 'present' : null,
+                      cartData: chunk.cartData ? 'present' : null
+                    },
+                    timestamp: Date.now()
+                  },
+                  newContext
+                };
+              }
+              
+              // Check for agent transitions (messages with agent attribution)
+              if (chunk.messages && Array.isArray(chunk.messages) && chunk.messages.length > 0) {
+                const lastMsg = chunk.messages[chunk.messages.length - 1];
+                if (lastMsg.agent && lastMsg.agent !== 'user') {
+                  return {
+                    metadata: {
+                      type: 'agent_transition',
+                      data: {
+                        agent: lastMsg.agent,
+                        role: lastMsg.role,
+                        timestamp: lastMsg.timestamp
+                      },
+                      timestamp: Date.now()
+                    },
+                    newContext
+                  };
+                }
+              }
+              
+              // Check for workflow context changes - ONLY emit if it changed
+              if (chunk.workflowContext && chunk.workflowContext !== prevContext) {
+                newContext = chunk.workflowContext;
+                return {
+                  metadata: {
+                    type: 'workflow_context',
+                    data: {
+                      context: chunk.workflowContext,
+                      dealData: chunk.dealData ? 'present' : null,
+                      pendingProduct: chunk.pendingProduct ? 'present' : null
+                    },
+                    timestamp: Date.now()
+                  },
+                  newContext
+                };
+              }
+              
+              return { metadata: null, newContext };
+            } catch (e) {
+              return { metadata: null, newContext: prevContext };
+            }
           }
 
           function extractReadableTexts(obj: any): string[] {
@@ -174,6 +288,17 @@ export async function POST(req: NextRequest) {
 
         try {
           for await (const chunk of iterable) {
+            // Extract and emit metadata for dev tools if present
+            const { metadata, newContext } = extractMetadata(chunk, previousWorkflowContext);
+            if (metadata) {
+              controller.enqueue(encoder.encode(JSON.stringify({ 
+                type: 'metadata', 
+                payload: metadata 
+              }) + '\n'));
+            }
+            // Update tracked context
+            previousWorkflowContext = newContext;
+            
             // If chunk is textual or binary, decode and split into lines
             if (typeof chunk === 'string' || chunk instanceof Uint8Array) {
               const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk);
