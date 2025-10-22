@@ -2,6 +2,7 @@ import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { getCIBACredentials } from '@auth0/ai-langchain';
 import { withTracing } from '../tracing';
+import { resetAuthorizationState } from '../auth0-ai-langchain';
 
 // Import authorization state management
 let authorizationState: { status: string; message?: string } | null = null;
@@ -14,13 +15,14 @@ const setAuthorizationApproved = () => {
 // Export function to get and reset state
 export const getShopAuthState = () => authorizationState;
 export const resetShopAuthState = () => {
+  console.log('[checkout-tool] Resetting shop authorization state');
   authorizationState = null;
-  // Also notify main auth state to reset
+  // Directly reset main authorization state
   try {
-    const { notifyShopAuthReset } = require('../auth0-ai-langchain');
-    notifyShopAuthReset();
+    resetAuthorizationState();
+    console.log('[checkout-tool] Main authorization state reset to idle via direct import');
   } catch (e) {
-    // Ignore if not available
+    console.error('[checkout-tool] Failed to reset main authorization state:', e);
   }
 };
 

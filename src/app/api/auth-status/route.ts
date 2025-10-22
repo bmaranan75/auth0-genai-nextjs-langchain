@@ -7,6 +7,8 @@ export async function GET(req: NextRequest) {
     const user = await getUser();
     const authState = getAuthorizationState();
     
+    console.log('[auth-status API] Current authorization state:', authState.status);
+    
     const response: any = {
       authenticated: !!user,
       user: user ? {
@@ -15,18 +17,24 @@ export async function GET(req: NextRequest) {
         name: user.name,
         picture: user.picture
       } : null,
+      authorizationStatus: authState.status, // Always include status (idle, pending, approved, denied, requested)
       timestamp: new Date().toISOString()
     };
 
-    // Include authorization status if there's an active authorization
-    if (authState.status !== 'idle') {
-      response.authorizationStatus = authState.status;
-      if (authState.message) {
-        response.authorizationMessage = authState.message;
-      }
+    // Include authorization message if present
+    if (authState.message) {
+      response.authorizationMessage = authState.message;
     }
     
-    return NextResponse.json(response);
+    console.log('[auth-status API] Returning response with status:', response.authorizationStatus);
+    
+    return NextResponse.json(response, {
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      }
+    });
   } catch (error: any) {
     console.error('[auth-status] Error getting user:', error);
     return NextResponse.json({

@@ -24,22 +24,18 @@ export const getAuthorizationState = () => {
   } catch (e) {
     // Ignore if shop tool not available
   }
+  console.log('[auth0-ai] getAuthorizationState returning:', authorizationState.status);
   return authorizationState;
 };
 
 export const resetAuthorizationState = () => {
+  console.log('[auth0-ai] resetAuthorizationState called - setting status to idle');
   authorizationState = { status: 'idle' };
-  // Also reset shop auth state
-  try {
-    const { resetShopAuthState } = require('./tools/checkout-langchain');
-    resetShopAuthState();
-  } catch (e) {
-    // Ignore if shop tool not available
-  }
 };
 
 // Function to be called when shop auth state changes to reset main auth state
 export const notifyShopAuthReset = () => {
+  console.log('[auth0-ai] Resetting authorization state to idle (called by shop tool)');
   authorizationState = { status: 'idle' };
 };
 

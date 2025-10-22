@@ -18,6 +18,7 @@ interface LangChainMessage {
   ephemeralType?: 'authorization-request' | 'authorization-approved' | 'authorization-denied' | 'authorization-pending';
 }
 
+
 function ChatInput(props: {
   onSubmit: (e: FormEvent<HTMLFormElement>) => void;
   value: string;
@@ -68,12 +69,16 @@ export function ChatWindow(props: {
   const [messages, setMessages] = useState<LangChainMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string>(''); // NEW: Single status indicator
+  const [authorizationMessage, setAuthorizationMessage] = useState<string>(''); // NEW: Dedicated authorization message
   const [isAuthorizationPending, setIsAuthorizationPending] = useState(false); // NEW: Track auth state
   const [conversationId, setConversationId] = useState<string>(() => generateConversationId());
   const [metadataEvents, setMetadataEvents] = useState<MetadataEvent[]>([]); // NEW: Dev metadata
   const [showDevMetadata, setShowDevMetadata] = useState(false); // NEW: Toggle for dev panel
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const authMessageTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Track auth message clear timeout
   const isAuthorizationPendingRef = useRef(false); // Ref for closure-safe access
+  const hasSeenActiveAuthRef = useRef(false); // Track if we've seen requested/pending/approved status
+  const hasAuthorizationMessageRef = useRef(false); // Track if we're showing an auth message
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
 
@@ -155,46 +160,131 @@ export function ChatWindow(props: {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
       }
+      if (authMessageTimeoutRef.current) {
+        clearTimeout(authMessageTimeoutRef.current);
+      }
     };
   }, []);
 
   // Function to start polling for authorization status
   const startAuthorizationPolling = () => {
+    console.log('[ChatWindow] ========== startAuthorizationPolling CALLED ==========');
     if (pollIntervalRef.current) {
+      console.log('[ChatWindow] Clearing existing polling interval');
       clearInterval(pollIntervalRef.current);
     }
     
     // Set authorization pending flag and show status
     updateAuthorizationPending(true);
-    setStatusMessage('⏳ Waiting for authorization approval...');
+    setAuthorizationMessage('⏳ Waiting for authorization approval...');
+    console.log('[ChatWindow] Starting new polling interval (2 second interval)');
     
     pollIntervalRef.current = setInterval(async () => {
       try {
-        const response = await fetch('/api/auth-status');
+        console.log('[ChatWindow] Polling is active, checking auth status...');
+        const response = await fetch('/api/auth-status', {
+          cache: 'no-store',
+          headers: {
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+          }
+        });
         if (response.ok) {
           const data = await response.json();
           
-          console.log('[ChatWindow] Auth status poll:', data.authorizationStatus);
+          console.log('[ChatWindow] Auth status poll result:', {
+            status: data.authorizationStatus,
+            timestamp: data.timestamp,
+            pollIntervalActive: pollIntervalRef.current !== null,
+            hasSeenActiveAuth: hasSeenActiveAuthRef.current
+          });
           
-          if (data.authorizationStatus && data.authorizationStatus !== 'pending') {
-            // Stop polling and clear authorization pending flag
+          // Track if we've seen an active authorization state (requested, pending, or approved)
+          if (data.authorizationStatus && ['requested', 'pending', 'approved'].includes(data.authorizationStatus)) {
+            console.log('[ChatWindow] Active authorization state detected:', data.authorizationStatus);
+            hasSeenActiveAuthRef.current = true;
+          }
+          
+          // Only clear message when transitioning from active auth to idle
+          // Don't clear if we've never seen an active authorization (prevents premature clearing)
+          if ((!data.authorizationStatus || data.authorizationStatus === 'idle') && hasSeenActiveAuthRef.current) {
+            console.log('[ChatWindow] ✅✅✅ IDLE STATE DETECTED AFTER ACTIVE AUTH - CLEARING MESSAGE ✅✅✅');
+            console.log('[ChatWindow] Authorization completed, clearing message');
+            updateAuthorizationPending(false);
+            hasSeenActiveAuthRef.current = false; // Reset for next authorization
+            if (pollIntervalRef.current) {
+              clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+              console.log('[ChatWindow] Polling interval cleared');
+            }
+            // Clear any existing timeout
+            if (authMessageTimeoutRef.current) {
+              clearTimeout(authMessageTimeoutRef.current);
+              authMessageTimeoutRef.current = null;
+            }
+            console.log('[ChatWindow] About to call setAuthorizationMessage("")');
+            setAuthorizationMessage('');
+            console.log('[ChatWindow] setAuthorizationMessage("") called - message should be cleared');
+            return;
+          } else if (!data.authorizationStatus || data.authorizationStatus === 'idle') {
+            // We got idle but haven't seen active auth yet - keep polling
+            console.log('[ChatWindow] Idle state detected but no active auth seen yet, continuing to poll...');
+            return;
+          }
+          
+          if (data.authorizationStatus === 'approved') {
+            console.log('[ChatWindow] 🎉 APPROVED status detected - keeping polling active');
+            // Update to approved message but keep polling to detect when it resets
+            updateAuthorizationPending(false);
+            
+            // Clear any existing timeout
+            if (authMessageTimeoutRef.current) {
+              clearTimeout(authMessageTimeoutRef.current);
+              authMessageTimeoutRef.current = null;
+            }
+            
+            console.log('[ChatWindow] Setting authorization message to APPROVED');
+            setAuthorizationMessage('✅ Authorization approved! Processing your request...');
+            console.log('[ChatWindow] Polling will continue to detect idle state');
+            
+            // Add a fallback timeout to clear the message after 10 seconds if polling doesn't detect idle
+            authMessageTimeoutRef.current = setTimeout(() => {
+              console.log('[ChatWindow] Fallback timeout: Clearing authorization message after 10s');
+              setAuthorizationMessage('');
+              hasSeenActiveAuthRef.current = false;
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+              }
+              authMessageTimeoutRef.current = null;
+            }, 10000);
+            // Don't stop polling yet - wait for state to reset to idle
+            
+          } else if (data.authorizationStatus === 'denied') {
+            // Stop polling for denied
             updateAuthorizationPending(false);
             if (pollIntervalRef.current) {
               clearInterval(pollIntervalRef.current);
               pollIntervalRef.current = null;
             }
             
-            // Update status indicator
-            if (data.authorizationStatus === 'approved') {
-              setStatusMessage('✅ Authorization approved! Processing your request...');
-              setTimeout(() => setStatusMessage(''), 3000);
-            } else if (data.authorizationStatus === 'denied') {
-              setStatusMessage('❌ Authorization was denied.');
-              setTimeout(() => setStatusMessage(''), 5000);
+            // Clear any existing timeout
+            if (authMessageTimeoutRef.current) {
+              clearTimeout(authMessageTimeoutRef.current);
+              authMessageTimeoutRef.current = null;
             }
-          } else if (data.authorizationStatus === 'pending') {
-            // Keep showing pending status
-            setStatusMessage('⏳ Waiting for authorization approval...');
+            
+            setAuthorizationMessage('❌ Authorization was denied.');
+            authMessageTimeoutRef.current = setTimeout(() => {
+              setAuthorizationMessage('');
+              authMessageTimeoutRef.current = null;
+            }, 5000);
+            
+          } else if (data.authorizationStatus === 'pending' || data.authorizationStatus === 'requested') {
+            // Keep showing pending/requested status
+            if (isAuthorizationPendingRef.current || data.authorizationStatus === 'requested') {
+              setAuthorizationMessage('⏳ Waiting for authorization approval...');
+            }
           }
         }
       } catch (error) {
@@ -216,6 +306,19 @@ export function ChatWindow(props: {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
     }
+    
+    // Clear any pending auth message timeout
+    if (authMessageTimeoutRef.current) {
+      clearTimeout(authMessageTimeoutRef.current);
+      authMessageTimeoutRef.current = null;
+    }
+    
+    // Clear all status messages and reset flags
+    setStatusMessage('');
+    setAuthorizationMessage('');
+    updateAuthorizationPending(false);
+    hasSeenActiveAuthRef.current = false; // Reset the active auth flag
+    hasAuthorizationMessageRef.current = false; // Reset the auth message flag
     
     console.log('[ChatWindow] Started new conversation:', newConversationId);
     toast.success('New conversation started');
@@ -260,11 +363,32 @@ export function ChatWindow(props: {
     
     // Show immediate authorization status if needed
     if (needsAuth) {
-      console.log('[ChatWindow] Authorization detected, showing status');
-      updateAuthorizationPending(true);
+      console.log('[ChatWindow] Authorization detected, adding inline ephemeral message');
+      
+      // Mark that we have an authorization message showing
+      hasAuthorizationMessageRef.current = true;
+      
+      // Remove any existing auth messages
+      setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+      
+      // Add inline ephemeral authorization message
+      const authRequestMessage: LangChainMessage = {
+        id: `auth-${Date.now()}`,
+        role: 'system',
+        content: 'Authorization request sent. Please check your device to approve the transaction...',
+        isEphemeral: true,
+        ephemeralType: 'authorization-request'
+      };
+      setMessages(prev => [...prev, authRequestMessage]);
+      
+      // After 1 second, update to pending status
       setTimeout(() => {
-        setStatusMessage('🔐 Authorization request sent. Please check your device to approve the transaction...');
-      }, 500); // Small delay to feel more natural
+        setMessages(prev => prev.map(msg => 
+          msg.ephemeralType === 'authorization-request' 
+            ? { ...msg, content: 'Waiting for authorization approval...', ephemeralType: 'authorization-pending' as const }
+            : msg
+        ));
+      }, 1000);
     }
     
     try {
@@ -339,7 +463,7 @@ export function ChatWindow(props: {
               
               if (data.type === 'progress') {
                 // Only update status if authorization is NOT pending
-                if (!isAuthorizationPending) {
+                if (!isAuthorizationPendingRef.current) {
                   setStatusMessage(data.content);
                   
                   // Auto-clear after 5 seconds of no updates
@@ -373,44 +497,138 @@ export function ChatWindow(props: {
         
         // Handle authorization status if present (before clearing status)
         if (authStatus) {
+          console.log('[ChatWindow] ========== SSE - Authorization status DETECTED ==========');
+          console.log('[ChatWindow] Status:', authStatus);
+          console.log('[ChatWindow] Message:', authMessage);
+          console.log('[ChatWindow] Current messages count:', messages.length);
+          console.log('[ChatWindow] Ephemeral auth messages:', messages.filter(m => m.isEphemeral && m.ephemeralType?.startsWith('authorization-')));
+          
           switch (authStatus) {
             case 'requested':
-              updateAuthorizationPending(true);
-              setStatusMessage(`🔐 Authorization requested: ${authMessage || 'Please check your device for approval'}`);
+              // Remove any existing auth messages
+              setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+              
+              // Add inline ephemeral message
+              const requestMessage: LangChainMessage = {
+                id: `auth-${Date.now()}`,
+                role: 'system',
+                content: authMessage || 'Authorization request sent. Please check your device to approve.',
+                isEphemeral: true,
+                ephemeralType: 'authorization-request'
+              };
+              setMessages(prev => [...prev, requestMessage]);
+              
+              // After 1 second, update to pending status
               setTimeout(() => {
-                setStatusMessage('⏳ Waiting for authorization approval...');
-                startAuthorizationPolling();
+                setMessages(prev => prev.map(msg => 
+                  msg.ephemeralType === 'authorization-request' 
+                    ? { ...msg, content: 'Waiting for authorization approval...', ephemeralType: 'authorization-pending' as const }
+                    : msg
+                ));
               }, 1000);
               break;
+              
             case 'pending':
-              updateAuthorizationPending(true);
-              setStatusMessage('⏳ Waiting for authorization approval...');
-              startAuthorizationPolling();
+              // Check if we already have a pending message
+              const hasPendingMsg = messages.some(m => m.ephemeralType === 'authorization-pending');
+              if (!hasPendingMsg) {
+                // Remove any existing auth messages
+                setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+                
+                // Add pending message
+                const pendingMessage: LangChainMessage = {
+                  id: `auth-${Date.now()}`,
+                  role: 'system',
+                  content: 'Waiting for authorization approval...',
+                  isEphemeral: true,
+                  ephemeralType: 'authorization-pending'
+                };
+                setMessages(prev => [...prev, pendingMessage]);
+              }
               break;
+              
             case 'approved':
+              console.log('[ChatWindow] ========== SSE - Authorization APPROVED CASE ==========');
+              console.log('[ChatWindow] About to clear authorization pending flag');
+              // Clear authorization pending flag to allow status messages again
               updateAuthorizationPending(false);
-              if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-              }
-              setStatusMessage('✅ Authorization approved! Processing your request...');
-              // Clear after 3 seconds
-              setTimeout(() => setStatusMessage(''), 3000);
+              console.log('[ChatWindow] Flag cleared, now updating message');
+              
+              // Update pending message to approved
+              setMessages(prev => {
+                console.log('[ChatWindow] Mapping messages to update auth message');
+                console.log('[ChatWindow] Messages before update:', prev.length);
+                const updated = prev.map(msg => 
+                  msg.isEphemeral && msg.ephemeralType?.startsWith('authorization-')
+                    ? { ...msg, content: 'Authorization approved! Processing your request...', ephemeralType: 'authorization-approved' as const }
+                    : msg
+                );
+                console.log('[ChatWindow] Messages after update:', updated.length);
+                console.log('[ChatWindow] Updated auth messages:', updated.filter(m => m.isEphemeral && m.ephemeralType?.startsWith('authorization-')));
+                return updated;
+              });
+              
+              console.log('[ChatWindow] Setting 3 second timeout to remove message');
+              // Remove the approved message after 3 seconds
+              setTimeout(() => {
+                console.log('[ChatWindow] ========== SSE - Timeout fired: Removing approved authorization message ==========');
+                setMessages(prev => {
+                  const filtered = prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-'));
+                  console.log('[ChatWindow] Messages before filter:', prev.length);
+                  console.log('[ChatWindow] Messages after filter:', filtered.length);
+                  return filtered;
+                });
+                hasAuthorizationMessageRef.current = false; // Clear the flag
+              }, 3000);
               break;
+              
             case 'denied':
+              console.log('[ChatWindow] SSE - Authorization DENIED, updating message');
+              // Clear authorization pending flag
               updateAuthorizationPending(false);
-              if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-              }
-              setStatusMessage('❌ Authorization was denied.');
-              // Clear after 5 seconds
-              setTimeout(() => setStatusMessage(''), 5000);
+              
+              // Update to denied message
+              setMessages(prev => prev.map(msg => 
+                msg.isEphemeral && msg.ephemeralType?.startsWith('authorization-')
+                  ? { ...msg, content: 'Authorization was denied.', ephemeralType: 'authorization-denied' as const }
+                  : msg
+              ));
+              
+              // Remove the denied message after 5 seconds
+              setTimeout(() => {
+                console.log('[ChatWindow] SSE - Removing denied authorization message');
+                setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+                hasAuthorizationMessageRef.current = false; // Clear the flag
+              }, 5000);
               break;
           }
         } else {
-          // Only clear status if there's no authorization in progress
-          setStatusMessage('');
+          // No explicit authStatus in SSE response
+          // If we have an authorization message showing (pending), and the stream completed successfully,
+          // assume authorization was approved and update the message
+          console.log('[ChatWindow] No authStatus in SSE response');
+          console.log('[ChatWindow] hasAuthorizationMessageRef.current:', hasAuthorizationMessageRef.current);
+          
+          if (hasAuthorizationMessageRef.current) {
+            console.log('[ChatWindow] Found pending auth message flag, assuming approval since stream completed successfully');
+            
+            // Clear authorization pending flag
+            updateAuthorizationPending(false);
+            
+            // Update to approved
+            setMessages(prev => prev.map(msg => 
+              msg.isEphemeral && msg.ephemeralType?.startsWith('authorization-')
+                ? { ...msg, content: 'Authorization approved! Processing your request...', ephemeralType: 'authorization-approved' as const }
+                : msg
+            ));
+            
+            // Remove after 3 seconds
+            setTimeout(() => {
+              console.log('[ChatWindow] Removing approved authorization message (from implicit approval)');
+              setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+              hasAuthorizationMessageRef.current = false; // Clear the flag
+            }, 3000);
+          }
         }
         
         // Add final assistant message
@@ -430,37 +648,88 @@ export function ChatWindow(props: {
       
         // Handle authorization status if present
         if (data.authorizationStatus) {
+          console.log('[ChatWindow] Non-streaming - Authorization status:', data.authorizationStatus);
+          
           switch (data.authorizationStatus) {
             case 'requested':
-              updateAuthorizationPending(true);
-              setStatusMessage(`🔐 Authorization requested: ${data.authorizationMessage || 'Please check your device for approval'}`);
+              // Remove any existing auth messages
+              setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+              
+              // Add inline ephemeral message
+              const requestMessage: LangChainMessage = {
+                id: `auth-${Date.now()}`,
+                role: 'system',
+                content: data.authorizationMessage || 'Authorization request sent. Please check your device to approve.',
+                isEphemeral: true,
+                ephemeralType: 'authorization-request'
+              };
+              setMessages(prev => [...prev, requestMessage]);
+              
+              // After 1 second, update to pending status
               setTimeout(() => {
-                setStatusMessage('⏳ Waiting for authorization approval...');
-                startAuthorizationPolling();
+                setMessages(prev => prev.map(msg => 
+                  msg.ephemeralType === 'authorization-request' 
+                    ? { ...msg, content: 'Waiting for authorization approval...', ephemeralType: 'authorization-pending' as const }
+                    : msg
+                ));
               }, 1000);
               break;
+              
             case 'pending':
-              updateAuthorizationPending(true);
-              setStatusMessage('⏳ Waiting for authorization approval...');
-              startAuthorizationPolling();
+              // Check if we already have a pending message
+              const hasPendingMsg = messages.some(m => m.ephemeralType === 'authorization-pending');
+              if (!hasPendingMsg) {
+                // Remove any existing auth messages
+                setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+                
+                // Add pending message
+                const pendingMessage: LangChainMessage = {
+                  id: `auth-${Date.now()}`,
+                  role: 'system',
+                  content: 'Waiting for authorization approval...',
+                  isEphemeral: true,
+                  ephemeralType: 'authorization-pending'
+                };
+                setMessages(prev => [...prev, pendingMessage]);
+              }
               break;
+              
             case 'approved':
+              console.log('[ChatWindow] Non-streaming - Authorization APPROVED, updating message');
+              // Clear authorization pending flag to allow status messages again
               updateAuthorizationPending(false);
-              if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-              }
-              setStatusMessage('✅ Authorization approved! Processing your request...');
-              setTimeout(() => setStatusMessage(''), 3000);
+              
+              // Update pending message to approved
+              setMessages(prev => prev.map(msg => 
+                msg.isEphemeral && msg.ephemeralType?.startsWith('authorization-')
+                  ? { ...msg, content: 'Authorization approved! Processing your request...', ephemeralType: 'authorization-approved' as const }
+                  : msg
+              ));
+              
+              // Remove the approved message after 3 seconds
+              setTimeout(() => {
+                console.log('[ChatWindow] Non-streaming - Removing approved authorization message');
+                setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+              }, 3000);
               break;
+              
             case 'denied':
+              console.log('[ChatWindow] Non-streaming - Authorization DENIED, updating message');
+              // Clear authorization pending flag
               updateAuthorizationPending(false);
-              if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-              }
-              setStatusMessage('❌ Authorization was denied.');
-              setTimeout(() => setStatusMessage(''), 5000);
+              
+              // Update to denied message
+              setMessages(prev => prev.map(msg => 
+                msg.isEphemeral && msg.ephemeralType?.startsWith('authorization-')
+                  ? { ...msg, content: 'Authorization was denied.', ephemeralType: 'authorization-denied' as const }
+                  : msg
+              ));
+              
+              // Remove the denied message after 5 seconds
+              setTimeout(() => {
+                console.log('[ChatWindow] Non-streaming - Removing denied authorization message');
+                setMessages(prev => prev.filter(msg => !msg.isEphemeral || !msg.ephemeralType?.startsWith('authorization-')));
+              }, 5000);
               break;
           }
         }
@@ -652,6 +921,8 @@ export function ChatWindow(props: {
       </div>
       
       <div className="sticky bottom-0 bg-background">
+        {/* Authorization messages now appear inline in chat - see ephemeral messages above */}
+        
         {/* Status Indicator - Single location for all progress updates */}
         {statusMessage && (
           <div className="max-w-[768px] mx-auto px-4 pb-2">
