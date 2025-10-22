@@ -8,5 +8,11 @@
     "deals": "./src/lib/agents/deals-agent.ts:dealsGraph"
   },
   "env": ".env.local",
-  "node_version": "20"
+  "node_version": "20",
+  "mcp": {
+    "enabled": true,
+    "server": "./src/mcp/server.ts",
+    "api_prefix": "/api/mcp/agents",
+    "transport": "stdio"
+  }
 }
