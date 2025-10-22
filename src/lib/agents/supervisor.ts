@@ -374,9 +374,11 @@ const SupervisorState = Annotation.Root({
       const validContexts = [
         'awaiting_deal_confirmation',
         'add_to_cart_with_deals', 
+        'add_to_cart_with_checkout', // NEW: for automatic checkout after cart
         'check_deals',
         'prepare_checkout',
-        'process_checkout'
+        'process_checkout',
+        'send_notification' // NEW: for routing to notification agent after checkout
       ];
       if (y && !validContexts.includes(y)) {
         console.warn(`[SupervisorState] Invalid workflow context: ${y}`);
@@ -620,8 +622,16 @@ export function invalidateSupervisorLlmCacheByPrefix(prefix: string) {
 }
 
 // Helper function to detect complex multi-step workflows
-function detectComplexWorkflow(messageContent: string): { isComplex: boolean; workflowType?: string; reason?: string } {
+function detectComplexWorkflow(messageContent: string): { isComplex: boolean; workflowType?: string; reason?: string; includesCheckout?: boolean } {
   const lowerContent = messageContent.toLowerCase();
+  
+  // Detect if checkout is mentioned
+  const hasCheckout = lowerContent.includes('checkout') || 
+                      lowerContent.includes('check out') || 
+                      lowerContent.includes('place order') ||
+                      lowerContent.includes('complete order') ||
+                      (lowerContent.includes('then') && (lowerContent.includes('continue') || lowerContent.includes('proceed'))) ||
+                      (lowerContent.includes('just') && lowerContent.includes('continue'));
   
   // Pattern 1: "check/find deals + add to cart" type queries
   const dealsAndCartPattern = (
@@ -647,28 +657,37 @@ function detectComplexWorkflow(messageContent: string): { isComplex: boolean; wo
   if (dealsAndCartPattern) {
     return {
       isComplex: true,
-      workflowType: 'deals_to_cart',
-      reason: 'User wants to check deals first, then add to cart based on availability'
+      workflowType: hasCheckout ? 'deals_to_cart_to_checkout' : 'deals_to_cart',
+      reason: hasCheckout 
+        ? 'User wants to check deals, add to cart, and proceed to checkout automatically'
+        : 'User wants to check deals first, then add to cart based on availability',
+      includesCheckout: hasCheckout
     };
   }
   
   if (conditionalPattern) {
     return {
       isComplex: true,
-      workflowType: 'conditional_purchase',
-      reason: 'User wants conditional action based on deal availability'
+      workflowType: hasCheckout ? 'conditional_purchase_with_checkout' : 'conditional_purchase',
+      reason: hasCheckout
+        ? 'User wants conditional action based on deal availability with automatic checkout'
+        : 'User wants conditional action based on deal availability',
+      includesCheckout: hasCheckout
     };
   }
   
   if (multiActionPattern) {
     return {
       isComplex: true,
-      workflowType: 'multi_step_purchase',
-      reason: 'User wants multiple coordinated actions (deals check + cart addition)'
+      workflowType: hasCheckout ? 'multi_step_purchase_with_checkout' : 'multi_step_purchase',
+      reason: hasCheckout
+        ? 'User wants multiple coordinated actions (deals check + cart addition + checkout)'
+        : 'User wants multiple coordinated actions (deals check + cart addition)',
+      includesCheckout: hasCheckout
     };
   }
   
-  return { isComplex: false };
+  return { isComplex: false, includesCheckout: false };
 }
 
 // Supervisor function to route requests
@@ -736,6 +755,58 @@ async function supervisor(state: typeof SupervisorState.State) {
   
   // CRITICAL: Check for workflow context continuations BEFORE planner logic
   // The planner doesn't have visibility into workflowContext, so we must handle it here first
+  
+  // NEW: Handle post-checkout notification routing (Hub-and-Spoke pattern)
+  if (workflowContext === 'send_notification') {
+    console.log(`[supervisor] CONTEXT: Detected send_notification context, routing to notification_agent`);
+    
+    // Add user-facing checkout completion message BEFORE routing to notification
+    const { notificationData } = state as any;
+    const orderId = notificationData?.orderId || 'N/A';
+    console.log(`[supervisor] Creating checkout completion message with orderId: ${orderId}`);
+    console.log(`[supervisor] notificationData:`, JSON.stringify(notificationData, null, 2));
+    
+    const checkoutCompletionMessage = new AIMessage(
+      `✅ Checkout completed successfully! Your order ID is: ${orderId}`
+    );
+    const annotatedCheckoutMessage = annotateMessage(
+      checkoutCompletionMessage, 
+      'assistant', 
+      'supervisor'
+    );
+    annotatedCheckoutMessage.timestamp = Date.now() + timestampOffset++;
+    
+    console.log(`[supervisor] Checkout completion message created:`, {
+      content: checkoutCompletionMessage.content,
+      agent: annotatedCheckoutMessage.agent,
+      role: annotatedCheckoutMessage.role,
+      timestamp: annotatedCheckoutMessage.timestamp,
+      hasProgressFlag: !!annotatedCheckoutMessage.progress,
+      isEphemeral: annotatedCheckoutMessage.progress?.ephemeral
+    });
+    
+    const notificationProgressMessage = getAgentProgressMessage('notification_agent', 'send_notification');
+    notificationProgressMessage.timestamp = Date.now() + timestampOffset++;
+    
+    const finalMessages = [...initialMessages, annotatedCheckoutMessage, notificationProgressMessage, ...(lastAnnotated ? [lastAnnotated] : [])];
+    console.log(`[supervisor] Total messages being returned: ${finalMessages.length}`);
+    console.log(`[supervisor] Messages summary:`, finalMessages.map((m: any) => ({
+      agent: m.agent,
+      role: m.role,
+      contentPreview: typeof m.message.content === 'string' ? m.message.content.substring(0, 50) : 'non-string',
+      ephemeral: m.progress?.ephemeral
+    })));
+    
+    return {
+      next: 'notification_agent',
+      userId,
+      conversationId,
+      workflowContext: 'send_notification',
+      plannerRecommendation, // Preserve planner recommendation
+      messages: finalMessages
+    };
+  }
+  
   if (workflowContext === 'awaiting_deal_confirmation' && pendingProduct) {
     console.log(`[supervisor] EARLY CHECK: Detected awaiting_deal_confirmation context, checking for affirmative response`);
     // Robust affirmative detection
@@ -937,7 +1008,26 @@ async function supervisor(state: typeof SupervisorState.State) {
       workflowContext: 'add_to_cart_with_deals',
       dealData,
       pendingProduct,
+      plannerRecommendation, // Preserve planner recommendation
       messages: [...initialMessages, cartProgressMessage, ...(lastAnnotated ? [lastAnnotated] : [])]
+    };
+  }
+  
+  // Handle automatic checkout after cart addition
+  if (workflowContext === 'add_to_cart_with_checkout') {
+    console.log(`[supervisor] OVERRIDE: Detected add_to_cart_with_checkout context, routing to cart_and_checkout for checkout`);
+    const checkoutProgressMessage = getAgentProgressMessage('cart_and_checkout', 'process_checkout');
+    checkoutProgressMessage.timestamp = Date.now() + timestampOffset++;
+    return {
+      next: 'cart_and_checkout',
+      userId,
+      conversationId,
+      workflowContext: 'process_checkout', // Switch to checkout context
+      dealData,
+      pendingProduct: null, // No pending product for checkout
+      cartData,
+      plannerRecommendation, // Preserve planner recommendation
+      messages: [...initialMessages, checkoutProgressMessage, ...(lastAnnotated ? [lastAnnotated] : [])]
     };
   }
   
@@ -1008,9 +1098,21 @@ User message: "${messageContent}"`);
   
   // Set appropriate workflow context for complex workflows
   let finalWorkflowContext = workflowContext;
+  let finalDealData = dealData;
+  
   if (complexWorkflow.isComplex && selectedAgent === 'deals' && extractedProduct) {
     finalWorkflowContext = 'check_deals';
     console.log(`[supervisor] Setting check_deals context for complex workflow: ${complexWorkflow.workflowType}`);
+    
+    // If workflow includes checkout, mark it in dealData so it flows through the entire workflow
+    if (complexWorkflow.includesCheckout) {
+      console.log(`[supervisor] Complex workflow includes automatic checkout - marking in dealData`);
+      finalDealData = {
+        ...dealData,
+        includesCheckout: true,
+        workflowType: complexWorkflow.workflowType
+      };
+    }
   }
   
   // Add agent-specific progress message before routing
@@ -1023,15 +1125,16 @@ User message: "${messageContent}"`);
     conversationId,
     workflowContext: finalWorkflowContext,
     pendingProduct: extractedProduct || pendingProduct,
-    dealData,
+    dealData: finalDealData,
     cartData,
+    plannerRecommendation, // CRITICAL: Preserve planner recommendation through state updates
     messages: [...initialMessages, finalProgressMessage, ...(lastAnnotated ? [lastAnnotated] : [])]
   };
 }
 
 // Agent functions that use the state
 async function catalogNode(state: typeof SupervisorState.State) {
-  const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData } = state;
+  const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData, plannerRecommendation } = state;
   
   console.log('[catalogNode] Processing with catalog agent for user:', userId, 'conversation:', conversationId);
   
@@ -1064,12 +1167,13 @@ async function catalogNode(state: typeof SupervisorState.State) {
     dealData,
     pendingProduct,
     cartData,
+    plannerRecommendation, // CRITICAL: Preserve planner recommendation
     next: END,
   };
 }
 
 export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
-  const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData } = state;
+  const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData, plannerRecommendation } = state;
   
   console.log('[cartAndCheckoutNode] Processing with cart & checkout agent for user:', userId, 'conversation:', conversationId);
   console.log('[cartAndCheckoutNode] Workflow context:', workflowContext);
@@ -1200,6 +1304,7 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
       dealData: null, // Clear deal data since the product wasn't found
       pendingProduct: null, // Clear pending product
       cartData,
+      plannerRecommendation, // CRITICAL: Preserve planner recommendation
       next: END, // End this interaction, user can start fresh
     };
   }
@@ -1215,6 +1320,7 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
   if (structured && structured.checkoutStatus) {
     if (structured.checkoutStatus === 'success') {
       console.log('[cartAndCheckoutNode] Structured checkout success detected with orderId:', structured.orderId);
+      
       const notificationPayload = {
         userId,
         conversationId,
@@ -1231,22 +1337,23 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
       // Log routing decision for debugging
       console.log('[cartAndCheckoutNode] ROUTING DECISION:', {
         fromAgent: 'cart_and_checkout',
-        toAgent: 'notification_agent',
-        reason: 'Structured checkout success - routing to notification',
+        toAgent: 'supervisor',
+        reason: 'Structured checkout success - routing to supervisor with send_notification context',
         orderId: structured.orderId,
-        state: { workflowContext: null, pendingProduct: null, cartData: null }
+        state: { workflowContext: 'send_notification', pendingProduct: null, cartData: null }
       });
 
       return {
         messages: annotatedResponses,
         userId,
         conversationId,
-        workflowContext: null,
+        workflowContext: 'send_notification', // Set context for supervisor to route to notification
         dealData,
         pendingProduct: null,
         cartData: null, // clear cart after successful checkout
         notificationData: notificationPayload,
-        next: 'notification_agent'
+        plannerRecommendation, // CRITICAL: Preserve planner recommendation
+        next: 'supervisor' // Route back to supervisor following hub-and-spoke pattern
       };
     }
 
@@ -1270,6 +1377,7 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
         dealData,
         pendingProduct: null,
         cartData,
+        plannerRecommendation, // CRITICAL: Preserve planner recommendation
         next: END
       };
     }
@@ -1300,21 +1408,22 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     // Log routing decision for debugging
     console.log('[cartAndCheckoutNode] ROUTING DECISION:', {
       fromAgent: 'cart_and_checkout',
-      toAgent: 'notification_agent',
-      reason: 'Checkout success (text fallback) - routing to notification',
-      state: { workflowContext: null, pendingProduct: null, cartData: null }
+      toAgent: 'supervisor',
+      reason: 'Checkout success (text fallback) - routing to supervisor with send_notification context',
+      state: { workflowContext: 'send_notification', pendingProduct: null, cartData: null }
     });
 
     return {
       messages: annotatedResponses,
       userId,
       conversationId,
-      workflowContext: null,
+      workflowContext: 'send_notification', // Set context for supervisor to route to notification
       dealData,
       pendingProduct: null,
       cartData: null, // clear cart after successful checkout
       notificationData: notificationPayload,
-      next: 'notification_agent'
+      plannerRecommendation, // CRITICAL: Preserve planner recommendation
+      next: 'supervisor' // Route back to supervisor following hub-and-spoke pattern
     };
   }
 
@@ -1326,6 +1435,56 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     state: { workflowContext, pendingProduct: !!pendingProduct, dealData: !!dealData, cartData: !!cartData }
   });
 
+  // Check if this was an add-to-cart operation that should automatically proceed to checkout
+  // Similar to add_to_cart_with_deals pattern
+  const shouldAutoCheckout = (
+    dealData && 
+    dealData.includesCheckout && 
+    workflowContext === 'add_to_cart_with_deals' &&
+    !isCheckoutRequest // Only auto-checkout if we're not already in checkout
+  );
+
+  if (shouldAutoCheckout) {
+    console.log('[cartAndCheckoutNode] AUTO-CHECKOUT: Complex workflow includes checkout - proceeding automatically');
+    console.log('[cartAndCheckoutNode] Workflow type:', dealData.workflowType);
+    
+    // Invalidate planner cache since we're changing workflow state
+    try { invalidatePlannerCacheByPrefix(`${conversationId || 'global'}:${userId}`); } catch (e) { console.warn('[supervisor] Failed to invalidate planner cache', e); }
+    
+    // Add progress message for automatic checkout transition
+    const checkoutProgressMessage = createProgressMessage('💳 Proceeding to checkout automatically...', 'supervisor');
+    const messagesWithProgress = [
+      ...annotatedResponses,
+      checkoutProgressMessage
+    ];
+    
+    // Log routing decision for auto-checkout
+    console.log('[cartAndCheckoutNode] ROUTING DECISION:', {
+      fromAgent: 'cart_and_checkout',
+      toAgent: 'supervisor',
+      reason: 'Auto-checkout enabled in complex workflow - routing back for checkout delegation',
+      state: { 
+        workflowContext: 'add_to_cart_with_checkout',
+        includesCheckout: true
+      }
+    });
+    
+    return {
+      messages: messagesWithProgress,
+      userId,
+      conversationId,
+      workflowContext: 'add_to_cart_with_checkout', // New context similar to add_to_cart_with_deals
+      dealData: {
+        ...dealData,
+        includesCheckout: false // Prevent re-triggering, but keep other deal data
+      },
+      pendingProduct: null, // Clear pending product after adding to cart
+      cartData,
+      plannerRecommendation, // CRITICAL: Preserve planner recommendation
+      next: 'supervisor', // Route back to supervisor which will delegate to cart for checkout
+    };
+  }
+
   return {
     messages: annotatedResponses,
     // PRESERVE ALL STATE - critical for workflow continuity
@@ -1335,16 +1494,18 @@ export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
     dealData,
     pendingProduct,
     cartData,
+    plannerRecommendation, // CRITICAL: Preserve planner recommendation
     next: END,
   };
 }
 
 async function dealsNode(state: typeof SupervisorState.State) {
-  const { messages, userId, conversationId, workflowContext, pendingProduct, dealData, cartData } = state;
+  const { messages, userId, conversationId, workflowContext, pendingProduct, dealData, cartData, plannerRecommendation } = state;
   
   console.log('[dealsNode] Processing with deals agent for user:', userId, 'conversation:', conversationId);
   console.log('[dealsNode] Workflow context:', workflowContext);
   console.log('[dealsNode] Pending product:', pendingProduct);
+  console.log('[dealsNode] Planner recommendation:', plannerRecommendation);
   
   // Determine message to send to deals agent
   const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
@@ -1413,6 +1574,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
       dealData,
       pendingProduct: null,
       cartData,
+      plannerRecommendation, // CRITICAL: Preserve planner recommendation
       next: END
     };
   }
@@ -1448,7 +1610,6 @@ async function dealsNode(state: typeof SupervisorState.State) {
         ? userMessages[userMessages.length - 1].message.content 
         : String(userMessages[userMessages.length - 1].message.content))
     : messageToAgent;
-  const originalMessageLower = String(originalUserMessage).toLowerCase();
   
   // Check if this is a complex workflow that should auto-proceed
   const modifiedMessageLower = messageToAgent.toLowerCase();
@@ -1459,18 +1620,16 @@ async function dealsNode(state: typeof SupervisorState.State) {
     (modifiedMessageLower.includes('complex workflow request'))
   );
   
-  // Check if user wants to auto-apply deals (no confirmation needed)
-  const autoApplyIntent = (
-    originalMessageLower.includes('just take') ||
-    originalMessageLower.includes('use any deal') ||
-    originalMessageLower.includes('apply any deal') ||
-    originalMessageLower.includes('use the deal') ||
-    originalMessageLower.includes('apply the deal') ||
-    originalMessageLower.includes('apply them') ||
-    originalMessageLower.includes('take them') ||
-    (originalMessageLower.includes('if') && originalMessageLower.includes('deal') && 
-     (originalMessageLower.includes('use') || originalMessageLower.includes('apply') || originalMessageLower.includes('take')))
-  );
+  // ENHANCED: Use planner's LLM-based intent analysis instead of keyword matching
+  // The planner already analyzed the user's intent with sophisticated NLP
+  // This eliminates the need for fragile keyword matching and leverages the planner's
+  // comprehensive understanding of user intent across various phrasings
+  const autoApplyIntent = plannerRecommendation?.autoApplyIntent === true;
+  
+  console.log('[dealsNode] Auto-apply intent from planner:', autoApplyIntent);
+  if (!plannerRecommendation) {
+    console.warn('[dealsNode] No planner recommendation available - defaulting to manual confirmation');
+  }
   
   // Simple check for deal confirmation prompts
   const requiresConfirmation = responseContent.toLowerCase().includes('would you like') ||
@@ -1525,6 +1684,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
         cartData, // Preserve cart data
         userId,
         conversationId,
+        plannerRecommendation, // CRITICAL: Preserve planner recommendation
         next: 'supervisor', // Route back to supervisor for delegation
       };
     } else if (requiresConfirmation) {
@@ -1561,6 +1721,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
         cartData, // Preserve cart data
         userId,
         conversationId,
+        plannerRecommendation, // CRITICAL: Preserve planner recommendation
         next: END,
       };
     } else {
@@ -1595,6 +1756,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
         cartData,
         userId,
         conversationId,
+        plannerRecommendation, // CRITICAL: Preserve planner recommendation
         next: 'cart_and_checkout',
       };
     }
@@ -1636,6 +1798,7 @@ async function dealsNode(state: typeof SupervisorState.State) {
         cartData,
         userId,
         conversationId,
+        plannerRecommendation, // CRITICAL: Preserve planner recommendation
         next: END,
       };
     }
@@ -1678,128 +1841,23 @@ async function paymentNode(state: typeof SupervisorState.State) {
   };
 }
 
-// Simple Pushover client helper - uses fetch to call Pushover API
-// Expects environment variables: PUSHOVER_TOKEN (application token), PUSHOVER_USER (user key)
-import fetch from 'node-fetch';
+// Import notification agent functionality from separate module
+import { 
+  notificationAgent as notificationAgentImpl,
+  sendPushoverNotification,
+  __setSendPushoverNotificationForTests,
+  __resetSendPushoverNotificationForTests
+} from './notificationAgent';
 
-let sendPushoverNotificationImpl: (payload: { title: string; message: string; user?: string; token?: string }) => Promise<any> = async (payload) => {
-  const token = payload.token || process.env.PUSHOVER_TOKEN;
-  const user = payload.user || process.env.PUSHOVER_USER;
-
-  if (!token || !user) {
-    console.warn('[notification_agent] Missing Pushover configuration (PUSHOVER_TOKEN/PUSHOVER_USER)');
-    return { ok: false, error: 'Missing pushover config' };
-  }
-
-  const form = new URLSearchParams();
-  form.append('token', token);
-  form.append('user', user);
-  form.append('title', payload.title);
-  form.append('message', payload.message);
-
-  try {
-    const res = await fetch('https://api.pushover.net/1/messages.json', {
-      method: 'POST',
-      body: form
-    });
-    const json = await res.json();
-    return { ok: res.ok, result: json };
-  } catch (error) {
-    console.error('[notification_agent] Error sending pushover notification:', error);
-    return { ok: false, error };
-  }
-};
-
-async function sendPushoverNotification(payload: { title: string; message: string; user?: string; token?: string }) {
-  return sendPushoverNotificationImpl(payload);
-}
-
-export function __setSendPushoverNotificationForTests(fn: any) {
-  sendPushoverNotificationImpl = fn;
-}
-
-export function __resetSendPushoverNotificationForTests() {
-  sendPushoverNotificationImpl = async (payload) => {
-    const token = payload.token || process.env.PUSHOVER_TOKEN;
-    const user = payload.user || process.env.PUSHOVER_USER;
-    if (!token || !user) return { ok: false, error: 'Missing pushover config' };
-    const form = new URLSearchParams();
-    form.append('token', token);
-    form.append('user', user);
-    form.append('title', payload.title);
-    form.append('message', payload.message);
-    try {
-      const res = await fetch('https://api.pushover.net/1/messages.json', { method: 'POST', body: form });
-      const json = await res.json();
-      return { ok: res.ok, result: json };
-    } catch (error) {
-      return { ok: false, error };
-    }
-  };
-}
-
+// Wrapper function to adapt state format for notification agent
 async function notificationAgent(state: typeof SupervisorState.State) {
-  const { notificationData, userId, conversationId } = state as any;
-
-  console.log('[notificationAgent] Running notification agent for user:', userId, 'conversation:', conversationId);
-  
-  // Add ephemeral message for notification processing
-  const notificationProgressMessage = createProgressMessage('📧 Sending notifications...', 'notification_agent');
-  
-  if (!notificationData) {
-    console.log('[notificationAgent] No notificationData present - nothing to send');
-    
-    // Log routing decision for debugging
-    console.log('[notificationAgent] ROUTING DECISION:', {
-      fromAgent: 'notification_agent',
-      toAgent: END,
-      reason: 'No notification data - ending workflow',
-      state: { workflowContext: null, notificationData: null }
-    });
-    
-    return {
-      messages: [notificationProgressMessage, annotateMessage(new AIMessage('No notification to send.'), 'assistant', 'notification_agent')],
-      userId,
-      conversationId,
-      workflowContext: null,
-      notificationData: null,
-      next: END
-    };
-  }
-
-  const title = `Order Confirmation - ${userId}`;
-  const message = `Your order was completed. Summary: ${notificationData.summary || "(no summary)"}`;
-
-  const sendResult = await sendPushoverNotification({ title, message });
-
-  const feedbackMessage = sendResult.ok
-    ? new AIMessage('Notification sent successfully.')
-    : new AIMessage(`Failed to send notification: ${sendResult.error || JSON.stringify(sendResult.result)}`);
-
-  // Log routing decision for debugging
-  console.log('[notificationAgent] ROUTING DECISION:', {
-    fromAgent: 'notification_agent',
-    toAgent: END,
-    reason: sendResult.ok ? 'Notification sent successfully' : 'Notification send failed',
-    state: { workflowContext: null, notificationData: null }
-  });
-
-  return {
-    // Return the feedback message first so callers/tests that inspect the first
-    // message receive the success/failure text immediately. Keep the progress
-    // message present for streaming/UIs that prefer progress updates.
-    messages: [annotateMessage(feedbackMessage, 'assistant', 'notification_agent'), notificationProgressMessage],
-    userId,
-    conversationId,
-    workflowContext: null,
-    notificationData: null, // clear after sending
-    next: END
-  };
+  return notificationAgentImpl(state as any, annotateMessage, createProgressMessage);
 }
 
 import { responseTool, planTool } from '../tools/routing';
 
 // Build the graph
+// Graph Version: 2.0 - Hub-and-Spoke Compliant (No direct cart->notification edge)
 const toolNode = new ToolNode([responseTool, planTool]);
 
 // Wrapper node to adapt our AnnotatedMessage[] state to the ToolNode input
@@ -1850,15 +1908,17 @@ const workflow = new StateGraph(SupervisorState)
     cart_and_checkout: 'cart_and_checkout',
     payment: 'payment',
     deals: 'deals',
+    notification_agent: 'notification_agent', // RESTORED - notifications are handled by dedicated agent
   })
   .addEdge('tools', END)
   .addConditionalEdges('catalog', (state) => state.next, {
     supervisor: 'supervisor',
     [END]: END,
   })
+  // CRITICAL: Cart agent ONLY routes to supervisor or END (hub-and-spoke pattern)
+  // Notification handling is done internally by supervisor
   .addConditionalEdges('cart_and_checkout', (state) => state.next, {
     supervisor: 'supervisor',
-    notification_agent: 'notification_agent',
     [END]: END,
   })
   .addConditionalEdges('deals', (state) => state.next, {
@@ -2104,7 +2164,13 @@ export const createSupervisorAgent = (userId: string, conversationId?: string) =
 };
 
 // Export internal helpers for testing
-export { notificationAgent, sendPushoverNotification, END };
+export { 
+  notificationAgent, 
+  sendPushoverNotification, 
+  __setSendPushoverNotificationForTests,
+  __resetSendPushoverNotificationForTests,
+  END 
+};
 
 // Test helpers - allow tests to inject a mock LLM when needed
 // These are explicitly test-only helpers to avoid exposing mutable internals in production

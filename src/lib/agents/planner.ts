@@ -110,6 +110,14 @@ OUTPUT FORMAT: Return valid JSON with these fields:
 - confidence: number between 0.0 and 1.0
 - reasoning: brief explanation of your decision
 - task: response text (only required for direct_response action)
+- autoApplyIntent: boolean (true if user wants automatic deal application without confirmation)
+
+AUTO-APPLY INTENT DETECTION:
+Set autoApplyIntent=true when user indicates they want automatic deal application:
+- Phrases like: "just take/use/apply any deal", "use the deal", "apply it/them"
+- Conditional auto-apply: "if there's a deal, use it", "apply any deals available"
+- Implicit acceptance: "yes, apply", "sure, use it", "go ahead"
+- NOT auto-apply: simple questions like "check deals", "are there deals", or ambiguous requests
 
 CLASSIFICATION RULES:
 1. action="delegate" → Request involves ANY aspect of grocery shopping
@@ -139,16 +147,22 @@ Input: "Find organic bananas"
 Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "product search"}}
 
 Input: "Add milk to cart"
-Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "cart operation"}}
+Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "cart operation", "autoApplyIntent": false}}
+
+Input: "Add apples and just use any deals available"
+Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "cart with auto-apply", "autoApplyIntent": true}}
+
+Input: "If there's a deal on bananas, apply it and add to cart"
+Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "conditional auto-apply", "autoApplyIntent": true}}
 
 Input: "yes" [Context: awaiting_deal_confirmation=true]
-Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "continuation - confirming deal"}}
+Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "continuation - confirming deal", "autoApplyIntent": false}}
 
 Input: "no thanks" [Context: awaiting_deal_confirmation=true]
-Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "continuation - declining deal"}}
+Output: {{"action": "delegate", "confidence": 1.0, "reasoning": "continuation - declining deal", "autoApplyIntent": false}}
 
 Input: "Hello"
-Output: {{"action": "delegate", "confidence": 0.95, "reasoning": "greeting in shopping context"}}
+Output: {{"action": "delegate", "confidence": 0.95, "reasoning": "greeting in shopping context", "autoApplyIntent": false}}
 
 Input: "What's the weather?"
 Output: {{"action": "direct_response", "confidence": 0.95, "reasoning": "unrelated to grocery", "task": "I can only help with grocery shopping. What would you like to add to your cart?"}}
@@ -350,7 +364,8 @@ const planner = async (state: any) => {
       action: rawAction,
       task: typeof input.task === 'string' ? input.task : (input.task ? String(input.task) : undefined),
       confidence: typeof input.confidence === 'number' ? Math.max(0, Math.min(1, input.confidence)) : 0.5,
-      reasoning: typeof input.reasoning === 'string' ? input.reasoning : (input.reasoning ? String(input.reasoning) : '')
+      reasoning: typeof input.reasoning === 'string' ? input.reasoning : (input.reasoning ? String(input.reasoning) : ''),
+      autoApplyIntent: typeof input.autoApplyIntent === 'boolean' ? input.autoApplyIntent : false
     };
 
     // If direct_response, ensure there's at least some text in 'task' or 'reasoning'
@@ -395,9 +410,11 @@ const planner = async (state: any) => {
         role: 'assistant',
         agent: 'planner',
         timestamp: Date.now(),
-        planningRecommendation: finalPlan, // Changed from 'delegation' to 'planningRecommendation'
+        planningRecommendation: finalPlan, // Also stored in message metadata for compatibility
       },
     ],
+    // CRITICAL: Return plannerRecommendation as top-level state field so it propagates through LangGraph
+    plannerRecommendation: finalPlan,
   };
 
   // Cache the normalized planner output for short-term reuse
