@@ -21,35 +21,46 @@
  * - 'prepare_checkout'/'process_checkout': Checkout flow states
  */
 
-import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
+import { StateGraph, START, END } from '@langchain/langgraph';
 import { MemorySaver } from '@langchain/langgraph';
-import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage, SystemMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
-import { planner, invalidatePlannerCacheByPrefix } from './planner';
-import { MIN_PLANNER_CONFIDENCE, MIN_CONTINUATION_CONFIDENCE, SUPERVISOR_LLM_CACHE_TTL_MS } from './constants';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
+import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages';
+import { planner, invalidatePlannerCacheByPrefix } from './planner';
+import { MIN_PLANNER_CONFIDENCE, MIN_CONTINUATION_CONFIDENCE } from './constants';
 
-// Annotated message wrapper so we know which agent produced/handled each message
-type AgentRole = 'user' | 'assistant' | 'system';
-interface AnnotatedMessage {
-  message: HumanMessage | AIMessage | SystemMessage;
-  role: AgentRole;
-  agent?: string;        // e.g. 'catalog', 'cart_and_checkout', 'deals', 'payment'
-  senderId?: string;     // optional identifier of agent or external source
-  timestamp: number;
-  delegation?: {         // delegation information from planner
-    targetAgent: string;
-    task: string;
-    reasoning: string;
-  };
-  progress?: {           // progress tracking for streaming
-    isProgressUpdate: boolean;
-    step: string;
-    agent: string;
-    ephemeral?: boolean;      // NEW: marks message as ephemeral (not saved to history)
-    autoRemoveMs?: number;    // NEW: auto-dismiss timeout for UI
-  };
-}
+// Import from refactored modules
+import type { AnnotatedMessage, AgentRole } from './supervisor/types';
+import { SupervisorState } from './supervisor/state';
+import {
+  annotateMessage,
+  buildAgentContextMessage,
+  createProgressMessage,
+  getAgentProgressMessage
+} from './supervisor/message-utils';
+import {
+  normalizeProductName,
+  safeParseJson,
+  extractProductInfo as extractProductInfoFromModule
+} from './supervisor/product-utils';
+import {
+  detectComplexWorkflow,
+  detectContinuationIntent as detectContinuationIntentFromModule
+} from './supervisor/workflow-detection';
+import {
+  getLlm,
+  SAFE_MIN_PLANNER_CONFIDENCE,
+  SAFE_MIN_CONTINUATION_CONFIDENCE,
+  getSupervisorLlmCache,
+  setSupervisorLlmCache,
+  invalidateSupervisorLlmCacheByPrefix,
+  __clearSupervisorLlmCacheForTests,
+  __setSupervisorLlmCacheEntryForTests,
+  __setLlmForTests as __setLlmForTestsInternal,
+  __resetLlmForTests as __resetLlmForTestsInternal
+} from './supervisor/llm-utils';
+
+// Re-export types for backwards compatibility
+export type { AnnotatedMessage, AgentRole } from './supervisor/types';
 
 export const routePlanner = (state: typeof SupervisorState.State) => {
   const { messages, delegationDepth = 0 } = state as any;
@@ -122,370 +133,7 @@ export const routePlanner = (state: typeof SupervisorState.State) => {
     return "supervisor";
   }
   return END;
-};// Helper to wrap messages consistently
-export function annotateMessage(msg: HumanMessage | AIMessage | SystemMessage, role: AgentRole, agent?: string, senderId?: string): AnnotatedMessage {
-  return {
-    message: msg,
-    role,
-    agent,
-    senderId,
-    timestamp: Date.now()
-  };
-}
-
-// Build a compact context string for specialized agents.
-// Include: recent user messages (always), system messages, and assistant messages produced by the same agent.
-// Limit entries to avoid large payloads.
-export function buildAgentContextMessage(
-  annotatedMessages: Array<AnnotatedMessage>,
-  targetAgent: string,
-  currentUserMessage: string,
-  maxEntries = 6
-): string {
-  const filtered = annotatedMessages
-    .filter(m => {
-      // Always include user messages and system messages
-      if (m.role === 'user' || m.role === 'system') return true;
-      // Include assistant messages only if produced by the target agent
-      if (m.role === 'assistant' && m.agent === targetAgent) return true;
-      return false;
-    });
-
-  // Deduplicate by message content while preserving the most recent occurrence order
-  const seen = new Set<string>();
-  const deduped: AnnotatedMessage[] = [];
-  for (let i = filtered.length - 1; i >= 0; i--) {
-    const m = filtered[i];
-    const content = typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content);
-    if (!seen.has(content)) {
-      seen.add(content);
-      deduped.push(m);
-    }
-  }
-  deduped.reverse();
-
-  const recent = deduped.slice(-maxEntries); // take last N relevant entries
-
-  // Compose lines with agent/source annotation to help the LLM quickly contextualize
-  const lines = recent.map(m => {
-    const content = typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content);
-    const src = m.role === 'assistant' ? (m.agent || 'assistant') : (m.role === 'system' ? 'system' : 'user');
-    return `${src.toUpperCase()}: ${content}`;
-  });
-
-  // Add the current user message at the end (most relevant) only if it's not already present
-  const alreadyPresent = lines.some(l => l.includes(currentUserMessage));
-  if (!alreadyPresent) {
-    lines.push(`USER_LATEST: ${currentUserMessage}`);
-  }
-
-  // Keep the context compact
-  return lines.join('\n\n');
-}
-
-/**
- * Normalize product names from plural/conversational form to product code format
- * This helps bridge the gap between how users speak and how products are stored
- */
-function normalizeProductName(productName: string): string {
-  const normalized = productName.toLowerCase().trim();
-  
-  // Common plural to singular mappings for grocery items
-  const pluralToSingular: { [key: string]: string } = {
-    'apples': 'apple',
-    'bananas': 'banana', 
-    'oranges': 'orange',
-    'carrots': 'carrots', // already singular form in catalog
-    'potatoes': 'potato',
-    'tomatoes': 'tomato',
-    'onions': 'onion',
-    'eggs': 'egg',
-    'breads': 'bread',
-    'milks': 'milk',
-    'cheeses': 'cheese',
-    'yogurts': 'yogurt',
-    'cereals': 'cereal'
-  };
-  
-  // Return normalized form if mapping exists, otherwise return original
-  const result = pluralToSingular[normalized] || normalized;
-  console.log(`[normalizeProductName] ${productName} → ${result}`);
-  return result;
-}
-
-/**
- * PROGRESS TRACKING HELPERS
- * 
- * Helper functions to create user-friendly progress messages for streaming
- */
-function createProgressMessage(content: string, agent?: string, ephemeral: boolean = true): AnnotatedMessage {
-  return {
-    message: new AIMessage(content),
-    role: 'assistant',
-    agent: agent || 'supervisor',
-    timestamp: Date.now(),
-    progress: {
-      isProgressUpdate: true,
-      step: content,
-      agent: agent || 'supervisor',
-      ephemeral,            // Mark as ephemeral by default
-      autoRemoveMs: 5000    // Auto-dismiss after 5 seconds
-    }
-  };
-}
-
-/**
- * Get agent-specific progress message for routing
- * This is shown to the user BEFORE the agent starts working
- */
-function getAgentProgressMessage(agentName: string, context?: string): AnnotatedMessage {
-  let message: string;
-  
-  switch (agentName) {
-    case 'catalog':
-      message = '🛍️ Searching our catalog...';
-      break;
-    case 'deals':
-      message = '🏷️ Checking for deals...';
-      break;
-    case 'cart_and_checkout':
-      if (context === 'process_checkout' || context === 'prepare_checkout') {
-        message = '💳 Processing checkout...';
-      } else {
-        message = '🛒 Managing your cart...';
-      }
-      break;
-    case 'payment':
-      message = '💳 Managing payments...';
-      break;
-    case 'notification_agent':
-      message = '📧 Sending notifications...';
-      break;
-    default:
-      message = `⏳ Delegating to ${agentName}...`;
-  }
-  
-  return createProgressMessage(message, 'supervisor');
-}
-
-function getWorkflowSteps(workflowType: string): string[] {
-  switch (workflowType) {
-    case 'complex_checkout':
-      return [
-        '🔍 Searching for available deals...',
-        '🛒 Adding items to your cart...',
-        '💳 Proceeding to checkout...'
-      ];
-    case 'deal_search':
-      return [
-        '🔍 Searching for available deals...',
-        '📋 Analyzing best offers...'
-      ];
-    case 'cart_addition':
-      return [
-        '🛒 Adding items to your cart...',
-        '✅ Updating cart totals...'
-      ];
-    case 'checkout_process':
-      return [
-        '💳 Preparing checkout...',
-        '🔐 Processing payment authorization...',
-        '✅ Completing your order...'
-      ];
-    default:
-      return ['⏳ Processing your request...'];
-  }
-}
-
-/**
- * ENHANCED SUPERVISOR STATE
- * 
- * Robust state management with validation and intelligent merging:
- * - messages: Conversation history (limited to prevent memory bloat)
- * - next: Target agent for routing
- * - userId: User identification (with fallback validation)
- * - conversationId: Conversation instance identifier (with auto-generation)
- * - cartData: Cart state with intelligent merging
- * - workflowContext: Context validation for continuation scenarios
- * - dealData: Deal information with history preservation
- * - pendingProduct: Product info with structure validation
- */
-const SupervisorState = Annotation.Root({
-  messages: Annotation<Array<AnnotatedMessage>>({
-    reducer: (x, y) => {
-      const combined = x.concat(y);
-      // CRITICAL FIX: Keep ephemeral messages temporarily for streaming
-      // They will be visible in the stream chunks sent to the client
-      // But we still limit total history to prevent memory bloat
-      
-      // First, separate ephemeral (recent progress) from permanent messages
-      const ephemeral = combined.filter(msg => 
-        msg.progress?.isProgressUpdate && msg.progress?.ephemeral === true
-      );
-      const permanent = combined.filter(msg => 
-        !msg.progress?.isProgressUpdate || 
-        msg.progress?.ephemeral !== true
-      );
-      
-      // Keep only recent ephemeral messages (last 5 for current operation feedback)
-      const recentEphemeral = ephemeral.slice(-5);
-      
-      // Keep last 10 permanent messages for LLM context
-      const recentPermanent = permanent.slice(-10);
-      
-      // Combine: permanent messages first, then ephemeral (so they're at the end for streaming)
-      return [...recentPermanent, ...recentEphemeral];
-    },
-  }),
-  next: Annotation<string>({
-    reducer: (x, y) => y ?? x ?? END,
-  }),
-  userId: Annotation<string>({
-    reducer: (x, y) => {
-      if (!y && !x) {
-        console.warn('[SupervisorState] Missing userId - using default');
-        return 'default-user';
-      }
-      return y ?? x;
-    },
-  }),
-  conversationId: Annotation<string>({
-    reducer: (x, y) => {
-      if (!y && !x) {
-        console.warn('[SupervisorState] Missing conversationId - generating default');
-        return `conv-${Date.now()}`;
-      }
-      return y ?? x;
-    },
-  }),
-  cartData: Annotation<any>({
-    reducer: (x, y) => {
-      // Merge cart data intelligently
-      if (y === null) return null; // Explicit clear
-      if (!y) return x; // No new data
-      if (!x) return y; // First time
-      // Merge objects
-      return typeof y === 'object' && typeof x === 'object' ? { ...x, ...y } : y;
-    },
-  }),
-  workflowContext: Annotation<string>({
-    reducer: (x, y) => {
-      // Validate workflow context
-      const validContexts = [
-        'awaiting_deal_confirmation',
-        'add_to_cart_with_deals', 
-        'add_to_cart_with_checkout', // NEW: for automatic checkout after cart
-        'check_deals',
-        'prepare_checkout',
-        'process_checkout',
-        'send_notification' // NEW: for routing to notification agent after checkout
-      ];
-      if (y && !validContexts.includes(y)) {
-        console.warn(`[SupervisorState] Invalid workflow context: ${y}`);
-        return x; // Keep previous valid context
-      }
-      return y ?? x;
-    },
-  }),
-  dealData: Annotation<any>({
-    reducer: (x, y) => {
-      if (y === null) return null; // Explicit clear
-      if (!y) return x;
-      if (!x) return y;
-      // Intelligent merge - preserve important fields
-      return {
-        ...x,
-        ...y,
-        // Preserve history of deal interactions
-        history: [...(x.history || []), ...(y.history || [])]
-      };
-    },
-  }),
-  // Counter to prevent infinite delegation loops between planner and supervisor
-  delegationDepth: Annotation<number>({
-    reducer: (x, y) => {
-      // Accept explicit resets
-      if (y === null) return 0;
-      const prev = typeof x === 'number' ? x : 0;
-      const next = typeof y === 'number' ? y : prev;
-      // Clamp to a sensible maximum to avoid overflow
-      return Math.max(0, Math.min(next, 100));
-    },
-  }),
-  pendingProduct: Annotation<any>({
-    reducer: (x, y) => {
-      if (y === null) return null; // Explicit clear
-      if (!y) return x;
-      // Validate product structure
-      if (y && typeof y === 'object' && !y.product) {
-        console.warn('[SupervisorState] Invalid pendingProduct structure:', y);
-        return x;
-      }
-      return y;
-    },
-  }),
-  // notificationData: stores payload for post-checkout notifications (e.g., order id, summary)
-  notificationData: Annotation<any>({
-    reducer: (x, y) => {
-      if (y === null) return null; // Explicit clear
-      if (!y) return x;
-      if (!x) return y;
-      return { ...x, ...y };
-    },
-  }),
-  // Planner recommendation to be processed by supervisor
-  plannerRecommendation: Annotation<any>({
-    reducer: (x, y) => {
-      if (y === null) return null; // Explicit clear
-      if (!y) return x;
-      // Store the latest planner recommendation
-      return y;
-    },
-  }),
-});
-
-// Lazily initialize a ChatOpenAI instance so tests without API keys don't throw at import time
-let llm: any = null;
-function getLlm() {
-  if (llm) return llm;
-  try {
-    llm = new ChatOpenAI({ model: 'gpt-4o-mini', temperature: 0, maxRetries: 2, timeout: 50000 });
-    return llm;
-  } catch (e) {
-    // Minimal fallback implementation for tests - deterministic and safe
-    llm = {
-      invoke: async (msgs: any) => {
-        // Return simple default responses depending on system message content
-        const first = Array.isArray(msgs) && msgs[0];
-        const sys = first && first.type === 'system' ? first.content : '';
-        return { content: 'catalog' };
-      }
-    };
-    return llm;
-  }
-}
-
-// Helper to extract textual content from various LLM response shapes
-function extractLlmText(response: any): string {
-  if (!response) return '';
-  if (typeof response === 'string') return response;
-  if (typeof response.content === 'string') return response.content;
-  if (response.text && typeof response.text === 'string') return response.text;
-  const gen = (response.generations || response.choices || response.output || []);
-  if (Array.isArray(gen) && gen.length > 0) {
-    const first = gen[0];
-    if (typeof first === 'string') return first;
-    if (first.text) return first.text;
-    if (first.message && typeof first.message.content === 'string') return first.message.content;
-    if (first.output_text) return first.output_text;
-  }
-  try { return JSON.stringify(response); } catch (_) { return String(response); }
-}
-
-// Safe fallbacks for imported constants in case of runtime issues
-const SAFE_MIN_PLANNER_CONFIDENCE = typeof MIN_PLANNER_CONFIDENCE === 'number' ? MIN_PLANNER_CONFIDENCE : 0.4;
-const SAFE_MIN_CONTINUATION_CONFIDENCE = typeof MIN_CONTINUATION_CONFIDENCE === 'number' ? MIN_CONTINUATION_CONFIDENCE : 0.7;
-const SAFE_SUPERVISOR_LLM_CACHE_TTL_MS = typeof SUPERVISOR_LLM_CACHE_TTL_MS === 'number' ? SUPERVISOR_LLM_CACHE_TTL_MS : 30 * 1000;
+};
 
 // LangGraph server configuration
 const LANGGRAPH_SERVER_URL = 'http://localhost:2024';
@@ -532,162 +180,63 @@ export function __resetCallLangGraphAgentForTests() {
   callLangGraphAgentImpl = async (opts: AgentCallOptions) => globalLangGraphClient.callAgentWithStream(opts);
 }
 
-// LangGraphClient implementation was extracted to src/lib/agents/langgraphClient.ts
+// Re-export utility functions from modules for backwards compatibility
+export { 
+  annotateMessage,
+  buildAgentContextMessage,
+  normalizeProductName,
+  safeParseJson,
+  detectComplexWorkflow
+};
 
-// Enhanced product information extraction using LLM
-// Safely parse JSON blocks returned by LLMs (tries direct parse, then extracts first JSON object)
-export function safeParseJson<T = any>(text: string): T | null {
-  if (!text || typeof text !== 'string') return null;
-  try {
-    return JSON.parse(text) as T;
-  } catch (_e) {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]) as T;
-    } catch (_e2) {
-      return null;
-    }
-  }
+// Re-export cache functions
+export {
+  __clearSupervisorLlmCacheForTests,
+  __setSupervisorLlmCacheEntryForTests,
+  invalidateSupervisorLlmCacheByPrefix
+};
+
+// Re-export LLM test helpers
+export function __setLlmForTests(mock: any) {
+  __setLlmForTestsInternal(mock);
 }
 
-import extractProductInfoImpl from './productExtractor';
-import detectContinuationIntentImpl from './continuationDetector';
+export function __resetLlmForTests() {
+  __resetLlmForTestsInternal();
+}
 
-// Backwards-compatible wrappers so existing tests and external callers can still
-// call supervisor.extractProductInfo(...) and supervisor.detectContinuationIntent(...)
+// Wrapper functions with caching for backwards compatibility
 export async function extractProductInfo(content: string) {
-  // Supervisor-level LLM response cache to avoid duplicate LLM calls across quick retries
   const key = `extract:${String(content || '').slice(0, 1000)}`;
   const cached = getSupervisorLlmCache(key);
   if (cached !== undefined) return JSON.parse(JSON.stringify(cached));
 
-  const res = await extractProductInfoImpl(content, getLlm());
-  setSupervisorLlmCache(key, res);
+  const res = await extractProductInfoFromModule(content, getLlm(), {
+    get: getSupervisorLlmCache,
+    set: setSupervisorLlmCache
+  });
   return res;
 }
 
-export async function detectContinuationIntent(message: string, messages: Array<AnnotatedMessage>, workflowContext?: string, dealData?: any, pendingProduct?: any) {
-  // Build a fingerprint to cache continuation analyses
-  const fingerprint = [
-    String(message || '').slice(0, 1000),
-    workflowContext || '',
-    JSON.stringify(pendingProduct || {}).slice(0, 300),
-    JSON.stringify(dealData || {}).slice(0, 300),
-    messages.slice(-6).map(m => (typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content))).join('|').slice(0, 1000)
-  ].join('||');
-
-  const key = `continuation:${fingerprint}`;
-  const cached = getSupervisorLlmCache(key);
-  if (cached !== undefined) return JSON.parse(JSON.stringify(cached));
-
-  const res = await detectContinuationIntentImpl(message, messages, workflowContext, dealData, pendingProduct, getLlm());
-  setSupervisorLlmCache(key, res);
-  return res;
-}
-
-// ===== Supervisor-level LLM response cache (simple TTL) =====
-type SupCacheEntry = { value: any; expiresAt: number };
-const supervisorLlmCache = new Map<string, SupCacheEntry>();
-const SUP_CACHE_TTL = SUPERVISOR_LLM_CACHE_TTL_MS; // 30s default
-
-function getSupervisorLlmCache(key: string) {
-  const e = supervisorLlmCache.get(key);
-  if (!e) return undefined;
-  if (Date.now() > e.expiresAt) {
-    supervisorLlmCache.delete(key);
-    return undefined;
-  }
-  return e.value;
-}
-
-function setSupervisorLlmCache(key: string, value: any, ttl = SUP_CACHE_TTL) {
-  supervisorLlmCache.set(key, { value, expiresAt: Date.now() + ttl });
-}
-
-export function __clearSupervisorLlmCacheForTests() {
-  supervisorLlmCache.clear();
-}
-
-export function __setSupervisorLlmCacheEntryForTests(key: string, value: any, ttlMs?: number) {
-  setSupervisorLlmCache(key, value, ttlMs);
-}
-
-export function invalidateSupervisorLlmCacheByPrefix(prefix: string) {
-  for (const k of Array.from(supervisorLlmCache.keys())) {
-    if (k.startsWith(prefix)) {
-      supervisorLlmCache.delete(k);
+export async function detectContinuationIntent(
+  message: string,
+  messages: Array<AnnotatedMessage>,
+  workflowContext?: string,
+  dealData?: any,
+  pendingProduct?: any
+) {
+  return await detectContinuationIntentFromModule(
+    message,
+    messages,
+    workflowContext,
+    dealData,
+    pendingProduct,
+    getLlm(),
+    {
+      get: getSupervisorLlmCache,
+      set: setSupervisorLlmCache
     }
-  }
-}
-
-// Helper function to detect complex multi-step workflows
-function detectComplexWorkflow(messageContent: string): { isComplex: boolean; workflowType?: string; reason?: string; includesCheckout?: boolean } {
-  const lowerContent = messageContent.toLowerCase();
-  
-  // Detect if checkout is mentioned
-  const hasCheckout = lowerContent.includes('checkout') || 
-                      lowerContent.includes('check out') || 
-                      lowerContent.includes('place order') ||
-                      lowerContent.includes('complete order') ||
-                      (lowerContent.includes('then') && (lowerContent.includes('continue') || lowerContent.includes('proceed'))) ||
-                      (lowerContent.includes('just') && lowerContent.includes('continue'));
-  
-  // Pattern 1: "check/find deals + add to cart" type queries
-  const dealsAndCartPattern = (
-    (lowerContent.includes('check') || lowerContent.includes('find') || lowerContent.includes('look')) &&
-    (lowerContent.includes('deal') || lowerContent.includes('promotion') || lowerContent.includes('discount') || lowerContent.includes('sale')) &&
-    (lowerContent.includes('add') && lowerContent.includes('cart'))
   );
-  
-  // Pattern 2: Conditional workflows with "if" statements
-  const conditionalPattern = (
-    lowerContent.includes('if') &&
-    (lowerContent.includes('deal') || lowerContent.includes('discount') || lowerContent.includes('sale') || lowerContent.includes('promotion')) &&
-    (lowerContent.includes('add') || lowerContent.includes('buy') || lowerContent.includes('purchase'))
-  );
-  
-  // Pattern 3: "and" connecting multiple actions
-  const multiActionPattern = (
-    lowerContent.includes(' and ') &&
-    ((lowerContent.includes('deal') || lowerContent.includes('promotion') || lowerContent.includes('discount')) &&
-     (lowerContent.includes('add') || lowerContent.includes('cart')))
-  );
-  
-  if (dealsAndCartPattern) {
-    return {
-      isComplex: true,
-      workflowType: hasCheckout ? 'deals_to_cart_to_checkout' : 'deals_to_cart',
-      reason: hasCheckout 
-        ? 'User wants to check deals, add to cart, and proceed to checkout automatically'
-        : 'User wants to check deals first, then add to cart based on availability',
-      includesCheckout: hasCheckout
-    };
-  }
-  
-  if (conditionalPattern) {
-    return {
-      isComplex: true,
-      workflowType: hasCheckout ? 'conditional_purchase_with_checkout' : 'conditional_purchase',
-      reason: hasCheckout
-        ? 'User wants conditional action based on deal availability with automatic checkout'
-        : 'User wants conditional action based on deal availability',
-      includesCheckout: hasCheckout
-    };
-  }
-  
-  if (multiActionPattern) {
-    return {
-      isComplex: true,
-      workflowType: hasCheckout ? 'multi_step_purchase_with_checkout' : 'multi_step_purchase',
-      reason: hasCheckout
-        ? 'User wants multiple coordinated actions (deals check + cart addition + checkout)'
-        : 'User wants multiple coordinated actions (deals check + cart addition)',
-      includesCheckout: hasCheckout
-    };
-  }
-  
-  return { isComplex: false, includesCheckout: false };
 }
 
 // Supervisor function to route requests
@@ -2171,15 +1720,3 @@ export {
   __resetSendPushoverNotificationForTests,
   END 
 };
-
-// Test helpers - allow tests to inject a mock LLM when needed
-// These are explicitly test-only helpers to avoid exposing mutable internals in production
-export function __setLlmForTests(mock: any) {
-  // @ts-ignore
-  llm = mock;
-}
-
-export function __resetLlmForTests() {
-  // @ts-ignore
-  llm = null;
-}
