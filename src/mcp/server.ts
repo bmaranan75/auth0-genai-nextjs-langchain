@@ -1,25 +1,30 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import http from 'http';
 
 import { MCPAgentClient } from './client.js';
 import { mcpTools } from './tools.js';
 
 /**
- * MCP Server that exposes LangGraph agents via HTTP
- * This runs as a separate process from Next.js
+ * MCP Server that exposes LangGraph agents via SSE (Server-Sent Events)
+ * Production-ready implementation using HTTP/SSE transport
  * 
  * Architecture:
- * MCP Client (Claude Desktop) -> MCP Server (this file) -> Next.js API -> LangGraph Agents
+ * MCP Client (Claude Desktop/ChatGPT/Cursor) -> MCP Server (this file) -> Next.js API -> LangGraph Agents
+ * 
+ * Transport: SSE over HTTP (production-ready, works locally and in Kubernetes)
  */
 
 // Configuration from environment
 const NEXTJS_URL = process.env.NEXTJS_URL || 'http://localhost:3000';
 const MCP_API_KEY = process.env.MCP_API_KEY;
+const MCP_SERVER_PORT = parseInt(process.env.MCP_SERVER_PORT || '3001', 10);
+const MCP_SERVER_HOST = process.env.MCP_SERVER_HOST || '0.0.0.0'; // Accept connections from any IP
 
 if (!MCP_API_KEY) {
   console.error('ERROR: MCP_API_KEY environment variable is required');
@@ -51,7 +56,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 // Handle call_tool request
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: args = {} } = request.params;
 
   console.error(`[MCP Server] Tool called: ${name}`, JSON.stringify(args, null, 2));
 
@@ -148,18 +153,96 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Start MCP server
+// Start MCP server with SSE transport
 async function main() {
   console.error('[MCP Server] Starting Safeway Shopping Assistant MCP Server...');
-  console.error(`[MCP Server] Next.js URL: ${NEXTJS_URL}`);
-  console.error(`[MCP Server] MCP_API_KEY: ${MCP_API_KEY.substring(0, 10)}... (truncated)`);
+  console.error(`[MCP Server] Transport: SSE (Server-Sent Events)`);
+  console.error(`[MCP Server] Server URL: http://${MCP_SERVER_HOST}:${MCP_SERVER_PORT}`);
+  console.error(`[MCP Server] Next.js API URL: ${NEXTJS_URL}`);
+  console.error(`[MCP Server] MCP_API_KEY: ${MCP_API_KEY!.substring(0, 10)}... (truncated)`);
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // Create HTTP server for SSE transport
+  const httpServer = http.createServer(async (req, res) => {
+    // CORS headers for cross-origin requests
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  console.error('[MCP Server] Running on stdio transport');
-  console.error('[MCP Server] Ready to receive MCP requests from Claude Desktop');
-  console.error('[MCP Server] Available tools:', mcpTools.map(t => t.name).join(', '));
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+
+    // Health check endpoint
+    if (req.url === '/health' || req.url === '/') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'healthy',
+        service: 'safeway-shopping-assistant-mcp',
+        version: '1.0.0',
+        transport: 'sse',
+        tools: mcpTools.map(t => t.name),
+      }));
+      return;
+    }
+
+    // MCP SSE endpoint
+    if (req.url === '/sse' && req.method === 'POST') {
+      console.error('[MCP Server] New SSE connection established');
+
+      const transport = new SSEServerTransport('/message', res);
+      await server.connect(transport);
+
+      // Handle connection close
+      req.on('close', () => {
+        console.error('[MCP Server] SSE connection closed');
+      });
+
+      return;
+    }
+
+    // 404 for unknown routes
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
+
+  // Start listening
+  httpServer.listen(MCP_SERVER_PORT, MCP_SERVER_HOST, () => {
+    console.error(`[MCP Server] Listening on http://${MCP_SERVER_HOST}:${MCP_SERVER_PORT}`);
+    console.error('[MCP Server] SSE endpoint: POST http://${MCP_SERVER_HOST}:${MCP_SERVER_PORT}/sse');
+    console.error('[MCP Server] Health check: GET http://${MCP_SERVER_HOST}:${MCP_SERVER_PORT}/health');
+    console.error('[MCP Server] Ready to receive MCP requests from clients');
+    console.error('[MCP Server] Available tools:', mcpTools.map(t => t.name).join(', '));
+    console.error('');
+    console.error('[MCP Server] Configuration for clients:');
+    console.error(JSON.stringify({
+      mcpServers: {
+        'safeway-shopping-assistant': {
+          url: `http://localhost:${MCP_SERVER_PORT}/sse`,
+          transport: 'sse'
+        }
+      }
+    }, null, 2));
+  });
+
+  // Graceful shutdown
+  process.on('SIGINT', () => {
+    console.error('\n[MCP Server] Shutting down gracefully...');
+    httpServer.close(() => {
+      console.error('[MCP Server] Server closed');
+      process.exit(0);
+    });
+  });
+
+  process.on('SIGTERM', () => {
+    console.error('\n[MCP Server] Received SIGTERM, shutting down gracefully...');
+    httpServer.close(() => {
+      console.error('[MCP Server] Server closed');
+      process.exit(0);
+    });
+  });
 }
 
 main().catch((error) => {

@@ -24,8 +24,9 @@
     "db:check": "drizzle-kit check",
     "fga:init": "tsx src/lib/fga/fga-init.ts",
     "mcp:dev": "tsx watch src/mcp/server.ts",
-    "mcp:build": "tsc src/mcp/server.ts --outDir dist/mcp --module nodenext --moduleResolution nodenext --esModuleInterop",
-    "mcp:start": "node dist/mcp/server.js"
+    "mcp:build": "tsc src/mcp/server.ts --outDir dist/mcp --module nodenext --moduleResolution nodenext --esModuleInterop --target es2022",
+    "mcp:start": "node dist/mcp/server.js",
+    "mcp:prod": "npm run mcp:build && npm run mcp:start"
   },
   "engines": {
     "node": ">=18"
