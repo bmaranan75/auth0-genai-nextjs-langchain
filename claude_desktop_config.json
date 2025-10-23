@@ -1,8 +1,13 @@
 {
   "mcpServers": {
     "safeway-shopping-assistant": {
-      "url": "http://localhost:3001/sse",
-      "transport": "sse"
+      "command": "npx",
+      "args": ["-y", "tsx", "src/mcp/server-stdio.ts"],
+      "cwd": "/Users/bmara00/GithubPersonal/auth0-genai-nextjs-langchain",
+      "env": {
+        "NEXTJS_URL": "http://localhost:3000",
+        "MCP_API_KEY": "2cf6ea0bd761a602e81f69aebbc77d676dccf454a5bb650ab8d1f637a249493e"
+      }
     }
   }
 }

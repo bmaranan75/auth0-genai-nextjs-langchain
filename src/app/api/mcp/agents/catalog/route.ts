@@ -4,24 +4,31 @@ import { verifyMCPAuth, MCPAuthError } from '@/lib/mcp/auth';
 
 /**
  * MCP-specific endpoint for catalog agent
- * This is separate from existing /api/chat endpoints
+ * Supports both API Key (legacy) and OAuth2 dual token (enterprise) authentication
  */
 export async function POST(req: NextRequest) {
   try {
-    // Verify MCP authentication
-    if (!verifyMCPAuth(req)) {
-      throw new MCPAuthError();
-    }
+    // Verify MCP authentication (supports both API key and OAuth2)
+    const authContext = await verifyMCPAuth(req);
 
     const body = await req.json();
     const { action, threadId, ...args } = body;
 
-    console.log('[MCP Catalog] Request:', { action, args });
+    console.log('[MCP Catalog] Request:', { 
+      action, 
+      args,
+      clientId: authContext?.clientId,
+      userId: authContext?.userId,
+    });
 
-    // Generate a thread ID if not provided
-    const configThreadId = threadId || `mcp-catalog-${Date.now()}`;
+    // Generate a thread ID
+    // If user context available, include user ID for better tracking
+    const configThreadId = threadId || 
+      (authContext?.userId 
+        ? `mcp-catalog-${authContext.userId}-${Date.now()}`
+        : `mcp-catalog-${Date.now()}`);
 
-    // Invoke existing catalog agent (no changes to agent)
+    // Invoke existing catalog agent (no changes to agent logic)
     const result = await catalogGraph.invoke(
       {
         messages: [
@@ -46,13 +53,13 @@ export async function POST(req: NextRequest) {
 
     if (error instanceof MCPAuthError) {
       return NextResponse.json(
-        { error: 'Unauthorized' },
+        { error: 'Unauthorized', message: error.message },
         { status: 401 }
       );
     }
 
     return NextResponse.json(
-      { error: error.message || 'Internal server error' },
+      { error: (error as Error).message || 'Internal server error' },
       { status: 500 }
     );
   }

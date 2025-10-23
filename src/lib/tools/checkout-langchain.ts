@@ -2,7 +2,7 @@ import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { getCIBACredentials } from '@auth0/ai-langchain';
 import { withTracing } from '../tracing';
-import { resetAuthorizationState } from '../auth0-ai-langchain';
+import { resetAuthorizationState } from '../ciba-provider';
 
 // Import authorization state management
 let authorizationState: { status: string; message?: string } | null = null;

@@ -2,7 +2,7 @@ import { createReactAgent, ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatOpenAI } from '@langchain/openai';
 import { RunnableConfig } from '@langchain/core/runnables';
 
-import { withAsyncAuthorization } from './auth0-ai-langchain';
+import { withAsyncAuthorization } from './ciba-provider';
 import { checkoutTool, checkoutCartTool } from './tools/checkout-langchain';
 import {browseCatalogTool} from './tools/browse-catalog-langchain';
 import { addToCartTool } from './tools/add-to-cart-langchain';

@@ -1,4 +1,4 @@
-import { withAsyncAuthorization } from './auth0-ai-langchain';
+import { withAsyncAuthorization } from './ciba-provider';
 import { getUser } from './auth0';
 
 // Manual CIBA implementation for direct tool calls
