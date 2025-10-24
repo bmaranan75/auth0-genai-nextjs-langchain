@@ -28,6 +28,12 @@ import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages
 import { planner, invalidatePlannerCacheByPrefix } from './planner';
 import { MIN_PLANNER_CONFIDENCE, MIN_CONTINUATION_CONFIDENCE } from './constants';
 
+// Import specialized agent graphs for direct invocation
+import { catalogGraph } from './catalog-agent';
+import { cartAndCheckoutGraph } from './cart-and-checkout-agent';
+import { dealsGraph } from './deals-agent';
+import { paymentGraph } from './payment-agent';
+
 // Import from refactored modules
 import type { AnnotatedMessage, AgentRole } from './supervisor/types';
 import { SupervisorState } from './supervisor/state';
@@ -627,7 +633,23 @@ Respond with ONLY the agent name: catalog, cart_and_checkout, payment, or deals
 User message: "${messageContent}"`);
 
   const invokeMessages = lastAnnotated?.message ? [systemMessage, lastAnnotated.message] : [systemMessage];
+  
+  console.log('[supervisor] Invoking LLM for routing decision...');
+  console.log('[supervisor] Messages:', invokeMessages.map(m => ({ type: m.constructor.name, content: typeof m.content === 'string' ? m.content.substring(0, 100) : 'non-string' })));
+  
   const response = await getLlm().invoke(invokeMessages as any);
+  
+  console.log('[supervisor] LLM response:', { 
+    hasContent: !!response?.content, 
+    contentType: typeof response?.content,
+    content: response?.content ? String(response.content).substring(0, 100) : 'undefined'
+  });
+  
+  if (!response || !response.content) {
+    console.error('[supervisor] ERROR: LLM returned invalid response:', response);
+    throw new Error('LLM routing decision failed - no content in response');
+  }
+  
   const nextAgent = response.content.toString().trim().toLowerCase();
   
   // Validate and route
@@ -685,40 +707,67 @@ User message: "${messageContent}"`);
 async function catalogNode(state: typeof SupervisorState.State) {
   const { messages, userId, conversationId, workflowContext, dealData, pendingProduct, cartData, plannerRecommendation } = state;
   
-  console.log('[catalogNode] Processing with catalog agent for user:', userId, 'conversation:', conversationId);
+  console.log('[catalogNode] Processing with catalog agent (direct graph invocation) for user:', userId);
   
   const lastAnnotated = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : undefined;
   const messageContent = lastAnnotated && lastAnnotated.message
     ? (typeof lastAnnotated.message.content === 'string' ? lastAnnotated.message.content : String(lastAnnotated.message.content))
     : '';
 
-  // Build compact context for the catalog agent and send reduced history
+  // Build context for the catalog agent
   const catalogContext = buildAgentContextMessage(messages as AnnotatedMessage[], 'catalog', messageContent);
-  const result = await callLangGraphAgent({ agentId: 'catalog', message: catalogContext, userId: userId || 'default-user', conversationId: conversationId || `conv-${userId || 'default'}-session` });
+  
+  console.log('[catalogNode] Invoking catalog graph directly with message:', catalogContext.substring(0, 150));
+  
+  try {
+    // Invoke the catalog graph directly (no HTTP call)
+    const catalogInput = {
+      messages: [new HumanMessage(catalogContext)]
+    };
+    
+    const catalogResult = await catalogGraph.invoke(catalogInput, {
+      configurable: {
+        thread_id: conversationId || `catalog-${userId}-${Date.now()}`,
+        user_id: userId
+      }
+    });
+    
+    console.log('[catalogNode] Catalog graph returned', catalogResult.messages?.length || 0, 'messages');
+    
+    // Extract AI messages from the result
+    const aiMessages = (catalogResult.messages || [])
+      .filter((m: any) => m._getType() === 'ai')
+      .map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'catalog'));
+    
+    console.log('[catalogNode] Extracted', aiMessages.length, 'AI messages from catalog agent');
 
-  // Annotate returned messages as coming from the catalog assistant
-  const annotatedResponses = (result.messages || []).map((m: any) => annotateMessage(m as AIMessage, 'assistant', 'catalog'));
-
-  // Log routing decision for debugging
-  console.log('[catalogNode] ROUTING DECISION:', {
-    fromAgent: 'catalog',
-    toAgent: END,
-    reason: 'Task completed',
-    state: { workflowContext, pendingProduct: !!pendingProduct, dealData: !!dealData }
-  });
-
-  return {
-    messages: annotatedResponses,
-    // PRESERVE ALL STATE - critical for workflow continuity
-    userId,
-    conversationId,
-    workflowContext,
-    dealData,
-    pendingProduct,
-    cartData,
-    plannerRecommendation, // CRITICAL: Preserve planner recommendation
-    next: END,
-  };
+    return {
+      messages: aiMessages,
+      userId,
+      conversationId,
+      workflowContext,
+      dealData,
+      pendingProduct,
+      cartData,
+      plannerRecommendation,
+      next: END,
+    };
+    
+  } catch (error) {
+    console.error('[catalogNode] ERROR invoking catalog graph:', error);
+    const errorMessage = new AIMessage('I apologize, but I encountered an error while searching the catalog. Please try again.');
+    return {
+      messages: [annotateMessage(errorMessage, 'assistant', 'catalog')],
+      userId,
+      conversationId,
+      workflowContext,
+      dealData,
+      pendingProduct,
+      cartData,
+      plannerRecommendation,
+      next: END,
+    };
+  }
 }
 
 export async function cartAndCheckoutNode(state: typeof SupervisorState.State) {
@@ -1077,9 +1126,11 @@ async function dealsNode(state: typeof SupervisorState.State) {
     // Try extracting from each recent message, most recent first
     for (let i = recentUserMessages.length - 1; i >= 0 && !effectivePending; i--) {
       const msg = recentUserMessages[i];
-      const content = typeof msg.message.content === 'string' 
-        ? msg.message.content 
-        : String(msg.message.content);
+      const content = msg?.message?.content 
+        ? (typeof msg.message.content === 'string' ? msg.message.content : String(msg.message.content))
+        : '';
+      
+      if (!content) continue;
       
       console.log(`[dealsNode] Trying to extract from user message ${i + 1}:`, content.substring(0, 100));
       
@@ -1409,6 +1460,54 @@ import { responseTool, planTool } from '../tools/routing';
 // Graph Version: 2.0 - Hub-and-Spoke Compliant (No direct cart->notification edge)
 const toolNode = new ToolNode([responseTool, planTool]);
 
+// Input transformation node: Converts simple messages from HTTP API to AnnotatedMessages
+// When messages come from LangGraph HTTP API, they're in format: [{role: 'human', content: '...'}]
+// We need to convert them to AnnotatedMessage format for the supervisor
+async function inputTransformer(state: typeof SupervisorState.State) {
+  const messages = Array.isArray(state.messages) ? state.messages : [];
+  
+  // Check if messages are already AnnotatedMessages (have .message property)
+  const needsTransformation = messages.length > 0 && messages.some((m: any) => !m.message);
+  
+  if (!needsTransformation) {
+    console.log('[inputTransformer] Messages already in AnnotatedMessage format');
+    return { messages };
+  }
+
+  console.log('[inputTransformer] Converting', messages.length, 'messages to AnnotatedMessage format');
+  
+  const annotatedMessages = messages.map((m: any) => {
+    // If already an AnnotatedMessage, pass through
+    if (m.message && m.timestamp) {
+      return m;
+    }
+
+    // Convert simple {role, content} format to AnnotatedMessage
+    const role = m.role || 'user';
+    const content = m.content || '';
+    
+    // Create appropriate BaseMessage based on role
+    let baseMessage;
+    if (role === 'human' || role === 'user') {
+      baseMessage = new HumanMessage(content);
+    } else if (role === 'ai' || role === 'assistant') {
+      baseMessage = new AIMessage(content);
+    } else {
+      baseMessage = new SystemMessage(content);
+    }
+
+    return annotateMessage(baseMessage, role === 'human' || role === 'user' ? 'user' : 'assistant');
+  });
+
+  console.log('[inputTransformer] Transformed', annotatedMessages.length, 'messages');
+  
+  return {
+    messages: annotatedMessages,
+    userId: state.userId || 'anonymous',
+    conversationId: state.conversationId || `conv-${Date.now()}`,
+  };
+}
+
 // Wrapper node to adapt our AnnotatedMessage[] state to the ToolNode input
 // ToolNode expects either BaseMessage[] or { messages: BaseMessage[] } as input.
 // Our SupervisorState stores messages as AnnotatedMessage[], so convert before
@@ -1437,6 +1536,7 @@ async function toolsNode(state: typeof SupervisorState.State) {
 }
 
 const workflow = new StateGraph(SupervisorState)
+  .addNode('inputTransformer', inputTransformer)
   .addNode('planner', planner)
   .addNode('supervisor', supervisor)
   .addNode('catalog', catalogNode)
@@ -1445,7 +1545,8 @@ const workflow = new StateGraph(SupervisorState)
   .addNode('payment', paymentNode)
   .addNode('deals', dealsNode)
   .addNode('tools', toolsNode)
-  .addEdge(START, 'planner')
+  .addEdge(START, 'inputTransformer')
+  .addEdge('inputTransformer', 'planner')
   .addConditionalEdges('planner', routePlanner, {
     [END]: END,
     supervisor: 'supervisor',

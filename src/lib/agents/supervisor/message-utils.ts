@@ -48,8 +48,10 @@ export function buildAgentContextMessage(
   const deduped: AnnotatedMessage[] = [];
   for (let i = filtered.length - 1; i >= 0; i--) {
     const m = filtered[i];
-    const content = typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content);
-    if (!seen.has(content)) {
+    const content = m?.message?.content 
+      ? (typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content))
+      : '';
+    if (content && !seen.has(content)) {
       seen.add(content);
       deduped.push(m);
     }
@@ -60,10 +62,12 @@ export function buildAgentContextMessage(
 
   // Compose lines with agent/source annotation to help the LLM quickly contextualize
   const lines = recent.map(m => {
-    const content = typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content);
+    const content = m?.message?.content
+      ? (typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content))
+      : '';
     const src = m.role === 'assistant' ? (m.agent || 'assistant') : (m.role === 'system' ? 'system' : 'user');
     return `${src.toUpperCase()}: ${content}`;
-  });
+  }).filter(line => line.includes(': ')); // Filter out empty content lines
 
   // Add the current user message at the end (most relevant) only if it's not already present
   const alreadyPresent = lines.some(l => l.includes(currentUserMessage));

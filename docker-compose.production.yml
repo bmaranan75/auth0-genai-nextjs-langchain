@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # LangGraph Server
+  langgraph:
+    build:
+      context: .
+      dockerfile: langgraph.Dockerfile
+    ports:
+      - "2024:2024"
+    environment:
+      - NODE_ENV=production
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - AUTH0_DOMAIN=${AUTH0_DOMAIN}
+      - AUTH0_CLIENT_ID=${AUTH0_CLIENT_ID}
+      - AUTH0_CLIENT_SECRET=${AUTH0_CLIENT_SECRET}
+      - AUTH0_ISSUER_BASE_URL=${AUTH0_ISSUER_BASE_URL}
+      - AUTH0_TOKEN_ENDPOINT=${AUTH0_TOKEN_ENDPOINT}
+      - DATABASE_URL=${DATABASE_URL}
+      - SHOP_API_URL=${SHOP_API_URL}
+      - SHOP_API_AUDIENCE=${SHOP_API_AUDIENCE}
+      - ADD_PAYMENT_API_URL=${ADD_PAYMENT_API_URL}
+      - ADD_PAYMENT_API_AUDIENCE=${ADD_PAYMENT_API_AUDIENCE}
+      - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
+      - PUSHOVER_USER=${PUSHOVER_USER}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT}
+      - LANGCHAIN_ENDPOINT=${LANGCHAIN_ENDPOINT}
+      - IDENTITY_PROVIDER=${IDENTITY_PROVIDER}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2024/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  # Next.js UI (optional - include if deploying together)
+  nextjs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - LANGGRAPH_SERVER_URL=http://langgraph:2024
+      - APP_BASE_URL=${APP_BASE_URL}
+      - NEXTAUTH_URL=${NEXTAUTH_URL}
+      - AUTH0_SECRET=${AUTH0_SECRET}
+      - AUTH0_DOMAIN=${AUTH0_DOMAIN}
+      - AUTH0_CLIENT_ID=${AUTH0_CLIENT_ID}
+      - AUTH0_CLIENT_SECRET=${AUTH0_CLIENT_SECRET}
+      - AUTH0_ISSUER_BASE_URL=${AUTH0_ISSUER_BASE_URL}
+      - AUTH0_TOKEN_ENDPOINT=${AUTH0_TOKEN_ENDPOINT}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_URL=${DATABASE_URL}
+      - SHOP_API_URL=${SHOP_API_URL}
+      - SHOP_API_AUDIENCE=${SHOP_API_AUDIENCE}
+      - ADD_PAYMENT_API_URL=${ADD_PAYMENT_API_URL}
+      - ADD_PAYMENT_API_AUDIENCE=${ADD_PAYMENT_API_AUDIENCE}
+      - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
+      - PUSHOVER_USER=${PUSHOVER_USER}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT}
+    depends_on:
+      langgraph:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

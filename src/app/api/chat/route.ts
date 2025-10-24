@@ -1,349 +1,295 @@
+/**
+ * Chat API Route - Thin Proxy to LangGraph Server
+ * 
+ * This route acts as a thin proxy between the Next.js UI and the LangGraph server.
+ * All agent logic (including supervisor and planner) runs on the LangGraph server.
+ * 
+ * Responsibilities:
+ * - Authenticate users via Auth0
+ * - Create/retrieve conversation threads
+ * - Forward requests to LangGraph server's supervisor agent
+ * - Transform SSE events from LangGraph format to UI format
+ * - Stream responses back to the client
+ */
+
 import { NextRequest, NextResponse } from 'next/server';
-import { HumanMessage } from '@langchain/core/messages';
-import { createAgent } from '@/lib/multi-agent';
 import { getUser } from '@/lib/auth0';
-import { getAuthorizationState, resetAuthorizationState } from '@/lib/auth0-ai-langchain';
-import { InMemoryCache } from "@langchain/core/caches";
-import { LangChainTracer } from "langchain/callbacks";
+import { langgraphClient } from '@/lib/langgraph-proxy-client';
 
 // Configure runtime for Vercel
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60; // 60 seconds timeout
 
-// Initialize tracing
-if (process.env.LANGCHAIN_TRACING_V2 === 'true') {
-  const tracer = new LangChainTracer({
-    projectName: "Auth0 GenAI Next.js LangChain",
+/**
+ * Transform LangGraph SSE events to UI-expected format
+ * 
+ * LangGraph sends:
+ *   event: values
+ *   data: { "messages": [...] }
+ * 
+ * UI expects:
+ *   data: {"type": "message", "content": "..."}
+ */
+function transformLangGraphStream(originalStream: ReadableStream): ReadableStream {
+  const reader = originalStream.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  
+  return new ReadableStream({
+    async start(controller) {
+      let buffer = '';
+      let currentEvent = '';
+      let dataLines: string[] = [];
+      
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          
+          if (done) {
+            // Send final done event
+            controller.enqueue(encoder.encode('data: {"type":"done"}\n\n'));
+            controller.close();
+            break;
+          }
+          
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
+          
+          for (const line of lines) {
+            if (line.startsWith('event:')) {
+              // Process previous event if any
+              if (currentEvent && dataLines.length > 0) {
+                processEvent(currentEvent, dataLines, controller, encoder);
+              }
+              // Start new event
+              currentEvent = line.slice(7).trim();
+              dataLines = [];
+              
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(6).trim());
+              
+            } else if (line.trim() === '') {
+              // Empty line marks end of event
+              if (currentEvent && dataLines.length > 0) {
+                processEvent(currentEvent, dataLines, controller, encoder);
+                currentEvent = '';
+                dataLines = [];
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[transformLangGraphStream] Error:', error);
+        controller.error(error);
+      }
+    },
+    
+    cancel() {
+      reader.cancel();
+    }
   });
 }
 
-const cache = new InMemoryCache();
+function processEvent(
+  eventType: string,
+  dataLines: string[],
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder
+) {
+  try {
+    // Join multi-line data and parse
+    const dataStr = dataLines.join('');
+    const data = JSON.parse(dataStr);
+    
+    if (eventType === 'values') {
+      // Extract the last message from the agent
+      const messages = data.messages || [];
+      if (messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        
+        console.log('[processEvent] Last message agent:', lastMessage.agent, 'type:', lastMessage.message?.type);
+        
+        // Check if it's an AI message (agent response)
+        if (lastMessage.message?.type === 'ai' || lastMessage.role === 'assistant') {
+          const content = lastMessage.message?.content || lastMessage.content || '';
+          
+          if (content) {
+            // Check if this is a progress update (ephemeral message)
+            if (lastMessage.progress && lastMessage.progress.isProgressUpdate) {
+              console.log('[processEvent] Sending progress to UI:', content);
+              
+              // Send as progress event to UI
+              const uiEvent = {
+                type: 'progress',
+                content: content
+              };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(uiEvent)}\n\n`));
+            } 
+            // Skip internal planner messages (JSON responses)
+            else if (lastMessage.agent === 'planner') {
+              console.log('[processEvent] Skipping internal planner message');
+            }
+            // This is a final response message from an actual agent
+            else {
+              console.log('[processEvent] Sending message to UI from', lastMessage.agent, ':', content.substring(0, 100));
+              
+              // Send as message event to UI
+              const uiEvent = {
+                type: 'message',
+                content: content
+              };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(uiEvent)}\n\n`));
+            }
+          }
+        }
+      }
+      
+    } else if (eventType === 'metadata') {
+      // Forward metadata events
+      const uiEvent = {
+        type: 'metadata',
+        payload: data
+      };
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(uiEvent)}\n\n`));
+      
+    } else if (eventType === 'error') {
+      // Forward error events
+      const uiEvent = {
+        type: 'error',
+        content: data.message || 'An error occurred'
+      };
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(uiEvent)}\n\n`));
+    }
+    
+  } catch (error) {
+    console.error('[processEvent] Error processing event:', error);
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
-    // Add CORS headers for better browser compatibility
-    const headers = {
-      'Content-Type': 'application/json',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-    };
-
     const body = await req.json();
     const { messages, conversationId } = body;
     
+    // Validate input
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return NextResponse.json({
         message: "Hello! I'm your shopping assistant. How can I help you today?"
-      }, { headers });
+      });
     }
 
-    // Get the last message from the user
     const lastMessage = messages[messages.length - 1];
     if (!lastMessage || !lastMessage.content) {
       return NextResponse.json({
         message: "I didn't receive a message. Please try again."
-      }, { headers });
+      });
     }
 
-    try {
-      let userId = null;
-      // Get the authenticated user for Auth0 AI context
-      const user = await getUser();
-      userId = user?.sub;
-      console.log("[chat-api] User context:", user?.sub);
-      console.log("[chat-api] User message:", lastMessage.content);
-      
-      // Reset authorization state before processing
-      resetAuthorizationState();
-      
-      // Create a new multi-agent instance with the userId and conversationId for each request
-      // This uses the supervisor agent to route to specialized agents
-      const agent = createAgent(userId ?? '', conversationId);
+    // Step 1: Authenticate user via Auth0
+    const user = await getUser();
+    const userId = user?.sub || 'anonymous';
+    
+    console.log("[chat-proxy] Processing request for user:", userId);
+    console.log("[chat-proxy] Message:", lastMessage.content);
 
-      // Use streaming for real-time progress updates
-      console.log("[chat-api] Starting streaming response for user:", userId);
-      
-      // Create a ReadableStream for SSE (Server-Sent Events)
-      const stream = new ReadableStream({
-        async start(controller) {
-          const encoder = new TextEncoder();
-          
-          // Helper to send SSE data
-          const sendSSE = (data: any) => {
-            const message = `data: ${JSON.stringify(data)}\n\n`;
-            controller.enqueue(encoder.encode(message));
-          };
-          
-          try {
-            // Use streaming API - SupervisorAgent.stream() returns an async iterator
-            const streamIterator = await agent.stream(lastMessage.content, conversationId);
-            
-            // Track all messages to get final response
-            let latestState: any = null;
-            let finalResponse = '';
-            
-            // Track which progress messages have already been sent (by timestamp)
-            // This prevents sending duplicate progress updates when subsequent chunks
-            // contain the full message history
-            const sentProgressTimestamps = new Set<number>();
-            
-            // Track workflow context to only emit metadata when it changes
-            let previousWorkflowContext: string | null = null;
-            
-            // Process stream events
-            for await (const chunk of streamIterator) {
-              console.log("[chat-api] Stream chunk keys:", Object.keys(chunk));
-              
-              // Store the latest state from the stream
-              latestState = chunk;
-              
-              // Extract metadata for dev tools
-              for (const [nodeName, nodeOutput] of Object.entries(chunk)) {
-                if (nodeOutput && typeof nodeOutput === 'object') {
-                  // Check for planner recommendation
-                  if ((nodeOutput as any).plannerRecommendation) {
-                    sendSSE({
-                      type: 'metadata',
-                      payload: {
-                        type: 'planner_recommendation',
-                        data: (nodeOutput as any).plannerRecommendation,
-                        timestamp: Date.now()
-                      }
-                    });
-                  }
-                  
-                  // Check for supervisor decision (routing)
-                  if ((nodeOutput as any).next && (nodeOutput as any).next !== '__end__') {
-                    sendSSE({
-                      type: 'metadata',
-                      payload: {
-                        type: 'supervisor_decision',
-                        data: {
-                          targetAgent: (nodeOutput as any).next,
-                          workflowContext: (nodeOutput as any).workflowContext,
-                          dealData: (nodeOutput as any).dealData ? 'present' : null,
-                          pendingProduct: (nodeOutput as any).pendingProduct ? 'present' : null,
-                          cartData: (nodeOutput as any).cartData ? 'present' : null
-                        },
-                        timestamp: Date.now()
-                      }
-                    });
-                  }
-                  
-                  // Check for workflow context changes - ONLY emit if it changed
-                  const currentWorkflowContext = (nodeOutput as any).workflowContext;
-                  if (currentWorkflowContext && currentWorkflowContext !== previousWorkflowContext) {
-                    sendSSE({
-                      type: 'metadata',
-                      payload: {
-                        type: 'workflow_context',
-                        data: {
-                          context: currentWorkflowContext,
-                          dealData: (nodeOutput as any).dealData ? 'present' : null,
-                          pendingProduct: (nodeOutput as any).pendingProduct ? 'present' : null
-                        },
-                        timestamp: Date.now()
-                      }
-                    });
-                    previousWorkflowContext = currentWorkflowContext;
-                    console.log(`[chat-api] Workflow context changed to: ${currentWorkflowContext}`);
-                  }
-                }
-              }
-              
-              // LangGraph streams emit chunks with node names as keys
-              // e.g., { supervisor: { messages: [...], next: 'catalog', ... } }
-              // Extract messages from any node in the chunk
-              for (const [nodeName, nodeOutput] of Object.entries(chunk)) {
-                if (nodeOutput && typeof nodeOutput === 'object') {
-                  const messages = (nodeOutput as any).messages;
-                  
-                  if (messages && Array.isArray(messages)) {
-                    console.log(`[chat-api] Node '${nodeName}' emitted ${messages.length} messages`);
-                    
-                    // Check each message for progress updates
-                    for (const msg of messages) {
-                      if (msg && msg.progress?.isProgressUpdate && msg.progress?.ephemeral) {
-                        // Only send if we haven't sent this message before (check by timestamp)
-                        if (!sentProgressTimestamps.has(msg.timestamp)) {
-                          // Send progress update to client
-                          const progressContent = typeof msg.message?.content === 'string' 
-                            ? msg.message.content 
-                            : String(msg.message?.content || '');
-                          
-                          sendSSE({
-                            type: 'progress',
-                            content: progressContent,
-                            agent: msg.agent || nodeName,
-                            timestamp: msg.timestamp
-                          });
-                          
-                          // Mark this message as sent
-                          sentProgressTimestamps.add(msg.timestamp);
-                          console.log("[chat-api] Sent progress update:", progressContent, "at", msg.timestamp);
-                        } else {
-                          console.log("[chat-api] Skipping duplicate progress update:", msg.message?.content);
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            
-            // Extract final response after stream completes
-            console.log("[chat-api] Stream completed, extracting final response from latest state");
-            
-            if (latestState) {
-              // LangGraph stream chunks are keyed by node name
-              // Look through all nodes to find messages
-              let allMessages: any[] = [];
-              
-              for (const [nodeName, nodeOutput] of Object.entries(latestState)) {
-                if (nodeOutput && typeof nodeOutput === 'object') {
-                  const messages = (nodeOutput as any).messages;
-                  if (messages && Array.isArray(messages)) {
-                    console.log(`[chat-api] Found ${messages.length} messages from node '${nodeName}'`);
-                    allMessages = messages; // Use the last node's messages as the final state
-                  }
-                }
-              }
-              
-              if (allMessages.length > 0) {
-                // Get the last non-ephemeral, non-user message
-                const finalMessages = allMessages.filter((m: any) => {
-                  const isEphemeral = m.progress?.isProgressUpdate && m.progress?.ephemeral;
-                  const isUser = m.role === 'user';
-                  return !isEphemeral && !isUser;
-                });
-                
-                console.log("[chat-api] Filtered final messages count:", finalMessages.length);
-                
-                const lastMessage = finalMessages[finalMessages.length - 1];
-                
-                if (lastMessage) {
-                  console.log("[chat-api] Last message role:", lastMessage.role, "agent:", lastMessage.agent);
-                  
-                  // Handle AnnotatedMessage structure
-                  const unwrapped = lastMessage.message || lastMessage;
-                  
-                  // Extract content from various possible shapes
-                  if (typeof unwrapped === 'string') {
-                    finalResponse = unwrapped;
-                  } else if (typeof unwrapped.content === 'string') {
-                    finalResponse = unwrapped.content;
-                  } else if (unwrapped.content && Array.isArray(unwrapped.content)) {
-                    // Handle array content (some LangChain messages use this)
-                    finalResponse = unwrapped.content.map((c: any) => 
-                      typeof c === 'string' ? c : c.text || JSON.stringify(c)
-                    ).join('');
-                  } else if (unwrapped.text) {
-                    finalResponse = unwrapped.text;
-                  } else {
-                    finalResponse = String(unwrapped.content || unwrapped);
-                  }
-                  
-                  console.log("[chat-api] Extracted content:", finalResponse.substring(0, 100));
-                }
-              } else {
-                console.log("[chat-api] No messages found in latest state");
-              }
-            } else {
-              console.log("[chat-api] No latest state available");
-            }
-            
-            console.log("[chat-api] Final response extracted:", finalResponse);
-            
-            // Get authorization state after processing
-            const authState = getAuthorizationState();
-            
-            // Send final message
-            sendSSE({
-              type: 'message',
-              content: finalResponse || "I'm sorry, I couldn't process that request.",
-              authorizationStatus: authState.status !== 'idle' ? authState.status : undefined,
-              authorizationMessage: authState.message || undefined,
-              timestamp: Date.now()
-            });
-            
-            // Send done signal
-            sendSSE({ type: 'done' });
-            
-          } catch (error) {
-            console.error('[chat-api] Stream error:', error);
-            
-            // Send error to client
-            sendSSE({
-              type: 'error',
-              content: error instanceof Error && error.message === 'Request timeout'
-                ? "I apologize, but your request is taking longer than expected. Please try asking for something more specific or try again later."
-                : "I'm your shopping assistant! I can help you with product recommendations and shopping. What would you like to do today?",
-              timestamp: Date.now()
-            });
-            
-            sendSSE({ type: 'done' });
-          } finally {
-            controller.close();
-          }
-        }
+    // Step 2: Create or get conversation thread
+    const effectiveConvId = conversationId || `conv-${userId}-${Date.now()}`;
+    
+    let threadId: string;
+    try {
+      threadId = await langgraphClient.createThread({
+        conversationId: effectiveConvId,
+        userId: userId,
+        createdAt: new Date().toISOString(),
       });
-      
-      // Return streaming response
-      return new Response(stream, {
+      console.log("[chat-proxy] Thread ID:", threadId);
+    } catch (error) {
+      console.error("[chat-proxy] Failed to create thread:", error);
+      return NextResponse.json(
+        { 
+          message: "I'm having trouble connecting to the service. Please try again in a moment.",
+          error: "Failed to create conversation thread"
+        },
+        { status: 503 }
+      );
+    }
+
+    // Step 3: Stream from supervisor agent on LangGraph server
+    try {
+      const streamResponse = await langgraphClient.streamRun(
+        threadId,
+        'supervisor', // Call supervisor agent as entry point
+        {
+          messages: [{ role: 'human', content: lastMessage.content }],
+          userId: userId,
+          conversationId: effectiveConvId,
+        },
+        {
+          configurable: {
+            user_id: userId,
+            _credentials: {
+              user: user, // Pass full Auth0 user object for CIBA
+            },
+          },
+        }
+      );
+
+      console.log("[chat-proxy] Streaming response from LangGraph server...");
+      console.log("[chat-proxy] Response status:", streamResponse.status);
+
+      // Check if the response is actually a stream
+      if (!streamResponse.body) {
+        console.error("[chat-proxy] No response body from LangGraph server!");
+        return NextResponse.json(
+          { message: "Failed to get response from agent server" },
+          { status: 502 }
+        );
+      }
+
+      // Step 4: Transform LangGraph SSE events to UI-expected format
+      const transformedStream = transformLangGraphStream(streamResponse.body);
+
+      return new Response(transformedStream, {
         headers: {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache, no-store, must-revalidate',
           'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no', // Disable nginx buffering
         },
       });
+
+    } catch (streamError) {
+      console.error('[chat-proxy] Stream error:', streamError);
       
-    } catch (agentError) {
-      console.error('Agent error:', agentError);
-      
-      // Handle timeout specifically
-      if (agentError instanceof Error && agentError.message === 'Request timeout') {
-        return NextResponse.json({
-          message: "I apologize, but your request is taking longer than expected. Please try asking for something more specific or try again later.",
-          error: "Request timeout"
-        }, { headers });
-      }
-      
-      // Check if it's a recursion error
-      if (agentError && typeof agentError === 'object' && 'lc_error_code' in agentError) {
-        if (agentError.lc_error_code === 'GRAPH_RECURSION_LIMIT') {
-          console.error('GraphRecursionError detected. The agent may be stuck in a loop.');
-          return NextResponse.json({
-            message: "I apologize, but I encountered an issue processing your request. Please try rephrasing your question or ask for something more specific.",
-            error: "Request too complex - please simplify"
-          }, { headers });
-        }
-      }
-      
-      return NextResponse.json({
-        message: "I'm your shopping assistant! I can help you with product recommendations and shopping. What would you like to do today?"
-      }, { headers });
+      // Return error as JSON
+      return NextResponse.json(
+        {
+          message: "I apologize, but I encountered an error processing your request. Please try again.",
+          error: streamError instanceof Error ? streamError.message : "Unknown error"
+        },
+        { status: 500 }
+      );
     }
     
   } catch (error) {
-    console.error('API error:', error);
+    console.error('[chat-proxy] API error:', error);
     return NextResponse.json(
-      { error: 'Failed to process request' },
       { 
-        status: 500,
-        headers: {
-          'Content-Type': 'application/json',
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-        }
-      }
+        message: "I'm your shopping assistant! I can help you with product recommendations and shopping. What would you like to do today?",
+        error: 'Failed to process request' 
+      },
+      { status: 500 }
     );
   }
 }
 
 export async function GET() {
   return NextResponse.json({
-    status: "LangChain Agent Ready",
-    message: "Direct LangChain integration active - no LangGraph server needed",
-    runtime: "serverless",
-    deployment: "vercel-compatible"
+    status: "Chat Proxy Ready",
+    message: "Proxying to LangGraph server",
+    mode: "thin-proxy",
+    serverUrl: process.env.LANGGRAPH_SERVER_URL || 'http://127.0.0.1:8123',
   });
 }

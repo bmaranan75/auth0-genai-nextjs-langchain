@@ -1,0 +1,41 @@
+
+> auth0-assistant0@0.0.0 dev:langgraph
+> npx @langchain/langgraph-cli dev
+
+
+          Welcome to
+
+╦  ┌─┐┌┐┌┌─┐╔═╗┬─┐┌─┐┌─┐┬ ┬
+║  ├─┤││││ ┬║ ╦├┬┘├─┤├─┘├─┤
+╩═╝┴ ┴┘└┘└─┘╚═╝┴└─┴ ┴┴  ┴ ┴.js
+
+- 🚀 API: [36mhttp://localhost:2024[0m
+- 🎨 Studio UI: [36mhttps://smith.langchain.com/studio?baseUrl=http://localhost:2024[0m
+
+This in-memory server is designed for development and testing.
+For production use, please use LangGraph Cloud.
+
+
+[32minfo[39m:    [32m[2m▪[22m[0m [0m[32mStarting server...[39m
+[32minfo[39m:    [32m[2m▪[22m[0m [0m[32mInitializing storage...[39m
+[32minfo[39m:    [32m[2m▪[22m[0m [0m[32mRegistering graphs from /Users/bmara00/GithubPersonal/auth0-genai-nextjs-langchain[39m
+[32minfo[39m:    [32m[2m┏[22m[0m [0m[32mRegistering graph with id 'supervisor'[39m
+[2m[32minfo[39m[22m:    [32m[2m┗[22m[0m [0m[2m[1][22m { graph_id: [32m'supervisor'[39m }
+[32minfo[39m:    [32m[2m┏[22m[0m [0m[32mRegistering graph with id 'catalog'[39m
+[2m[32minfo[39m[22m:    [32m[2m┗[22m[0m [0m[2m[1][22m { graph_id: [32m'catalog'[39m }
+[32minfo[39m:    [32m[2m┏[22m[0m [0m[32mRegistering graph with id 'cart_and_checkout'[39m
+[2m[32minfo[39m[22m:    [32m[2m┗[22m[0m [0m[2m[1][22m { graph_id: [32m'cart_and_checkout'[39m }
+[32minfo[39m:    [32m[2m┏[22m[0m [0m[32mRegistering graph with id 'payment'[39m
+[2m[32minfo[39m[22m:    [32m[2m┗[22m[0m [0m[2m[1][22m { graph_id: [32m'payment'[39m }
+[32minfo[39m:    [32m[2m┏[22m[0m [0m[32mRegistering graph with id 'deals'[39m
+[2m[32minfo[39m[22m:    [32m[2m┗[22m[0m [0m[2m[1][22m { graph_id: [32m'deals'[39m }
+[CIBA Provider] Using auth0 CIBA implementation
+[CIBA Provider] Using auth0 CIBA implementation
+[CIBA Provider] Using auth0 CIBA implementation
+[CIBA Provider] Using auth0 CIBA implementation
+[32minfo[39m:    [32m[2m▪[22m[0m [0m[32mStarting 10 workers[39m
+[31merror[39m:   [31m[2m▪[22m[0m [0m[31mError: listen EADDRINUSE: address already in use ::1:2024[39m
+[31m    at Server.setupListenHandle [as _listen2] (node:net:1897:16)[39m
+[31m    at listenInCluster (node:net:1945:12)[39m
+[31m    at GetAddrInfoReqWrap.doListen [as callback] (node:net:2109:7)[39m
+[31m    at GetAddrInfoReqWrap.onlookup [as oncomplete] (node:dns:109:8)[39m

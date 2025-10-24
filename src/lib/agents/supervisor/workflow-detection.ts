@@ -96,7 +96,11 @@ export async function detectContinuationIntent(
       workflowContext || '',
       JSON.stringify(pendingProduct || {}).slice(0, 300),
       JSON.stringify(dealData || {}).slice(0, 300),
-      messages.slice(-6).map(m => (typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content))).join('|').slice(0, 1000)
+      messages.slice(-6).map(m => {
+        // Safely extract content from AnnotatedMessage format
+        const content = m?.message?.content || '';
+        return typeof content === 'string' ? content : JSON.stringify(content);
+      }).join('|').slice(0, 1000)
     ].join('||');
 
     const key = `continuation:${fingerprint}`;

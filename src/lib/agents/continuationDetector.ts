@@ -41,7 +41,10 @@ export async function detectContinuationIntent(message: string, messages: Annota
     workflowContext || '',
     JSON.stringify(pendingProduct || {}).slice(0, 300),
     JSON.stringify(dealData || {}).slice(0, 300),
-    messages.slice(-6).map(m => (typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message.content))).join('|').slice(0, 1000)
+    messages.slice(-6).map(m => {
+      const content = m?.message?.content || '';
+      return typeof content === 'string' ? content : JSON.stringify(content);
+    }).join('|').slice(0, 1000)
   ].join('||');
 
   const cacheKey = `continuation:${fingerprint}`;
@@ -61,8 +64,9 @@ export async function detectContinuationIntent(message: string, messages: Annota
 
   const recentMessages = messages.slice(-6).map(msg => {
     const role = msg.role === 'user' ? 'User' : msg.role === 'assistant' ? `${msg.agent || 'Assistant'}` : 'System';
-    const content = typeof msg.message.content === 'string' ? msg.message.content : JSON.stringify(msg.message.content);
-    return `${role}: ${content.substring(0, 150)}${content.length > 150 ? '...' : ''}`;
+    const content = msg?.message?.content || '';
+    const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
+    return `${role}: ${contentStr.substring(0, 150)}${contentStr.length > 150 ? '...' : ''}`;
   }).join('\n');
 
   const analysisPrompt = new SystemMessage(`You are analyzing user intent for conversation continuity in a shopping system.

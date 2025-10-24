@@ -198,7 +198,11 @@ const planner = async (state: any) => {
   const userId = (state && state.userId) ? String((state as any).userId) : 'anon';
   const convId = (state && state.conversationId) ? String((state as any).conversationId) : 'global';
   const contextKey = `${contextString}:${pendingProductString}:${dealStatusString}`;
-  const key = `${userId}:${convId}:${contextKey}:${messages.slice(-6).map((m: any) => typeof m.message.content === 'string' ? m.message.content : JSON.stringify(m.message)).join('|')}`;
+  const key = `${userId}:${convId}:${contextKey}:${messages.slice(-6).map((m: any) => {
+    // Safely extract content from either AnnotatedMessage or direct BaseMessage
+    const content = m?.message?.content || m?.content || '';
+    return typeof content === 'string' ? content : JSON.stringify(content);
+  }).join('|')}`;
   const cached = getPlannerCache(key);
   if (cached) {
     console.log('[planner] Returning cached plan');
